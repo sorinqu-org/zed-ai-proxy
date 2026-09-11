@@ -68,20 +68,41 @@ class AccountPool:
 
     def load_from_dict(self, data: Any) -> None:
         raw_list = data if isinstance(data, list) else data.get("accounts", [])
+        existing_map = {a.id: a for a in self.accounts}
+        existing_uid_map = {a.user_id: a for a in self.accounts if a.user_id}
         new_accounts = []
         for i, item in enumerate(raw_list):
             acc_id = str(item.get("id") or item.get("user_id") or f"acc-{i+1}")
+            user_id = str(item.get("user_id", ""))
             raw_tok = item.get("access_token", "")
             tok_str = json.dumps(raw_tok) if isinstance(raw_tok, dict) else str(raw_tok)
+            prev = existing_map.get(acc_id) or existing_uid_map.get(user_id)
+
+            cur_token = item.get("current_llm_token")
+            exp_at = item.get("expires_at")
+            tot_req = 0
+            succ_req = 0
+            fail_req = 0
+
+            if prev and prev.access_token == tok_str:
+                cur_token = cur_token or prev.current_llm_token
+                exp_at = exp_at or prev.expires_at
+                tot_req = prev.total_requests
+                succ_req = prev.successful_requests
+                fail_req = prev.failed_requests
+
             account = Account(
                 id=acc_id,
                 name=item.get("name", f"Account-{acc_id}"),
-                user_id=str(item.get("user_id", "")),
+                user_id=user_id,
                 access_token=tok_str,
                 organization_id=item.get("organization_id"),
-                current_llm_token=item.get("current_llm_token"),
-                expires_at=item.get("expires_at"),
+                current_llm_token=cur_token,
+                expires_at=exp_at,
                 status=item.get("status", "active"),
+                total_requests=tot_req,
+                successful_requests=succ_req,
+                failed_requests=fail_req,
             )
             new_accounts.append(account)
         self.accounts = new_accounts

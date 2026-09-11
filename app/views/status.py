@@ -16,6 +16,7 @@ async def get_status(request: Request) -> Dict[str, Any]:
 @router.post("/api/refresh", response_class=JSONResponse)
 async def trigger_refresh(request: Request) -> Dict[str, Any]:
     pool = request.app.state.pool
+    pool.load_from_file(settings.accounts_file)
     await pool.refresh_all_tokens()
     return {"status": "ok", "summary": pool.get_status_summary()}
 

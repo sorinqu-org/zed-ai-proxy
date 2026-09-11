@@ -78,7 +78,20 @@ Zed signs in via GitHub OAuth and stores credentials in your operating system's 
   Open `control keymgr.dll` -> **Windows Credentials** -> **Generic Credentials** -> `zed:url=https://zed.dev`.
   User name is `user_id`, and clicking **Show** next to password gives your `access_token`.
 
-### 3. Configure Accounts
+### 3. Automatic Account Import / Sync
+
+Instead of manually editing `accounts.json`, you can run the automatic sync utility:
+
+```bash
+python3 scripts/sync_account.py --name "My Zed Pro"
+```
+
+- Automatically extracts `user_id` and `access_token` from your OS keychain.
+- Validates the token against `cloud.zed.dev`.
+- Upserts the credentials into `accounts.json` (updates existing or adds new).
+- Sends a hot-reload notification to the proxy via `/api/refresh` if it is currently running.
+
+### 4. Manual Configuration (Alternative)
 
 Copy the template:
 ```bash
@@ -98,7 +111,7 @@ Add your Zed account credentials:
 ]
 ```
 
-### 4. Run the Proxy
+### 5. Run the Proxy
 
 ```bash
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
