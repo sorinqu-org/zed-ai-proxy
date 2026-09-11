@@ -1,0 +1,16 @@
+[
+  {
+    "id": "acc-1",
+    "name": "Zed Pro Main",
+    "user_id": "12345",
+    "access_token": "zed_access_token_here",
+    "organization_id": null
+  },
+  {
+    "id": "acc-2",
+    "name": "Zed Pro Backup",
+    "user_id": "67890",
+    "access_token": "zed_second_access_token_here",
+    "organization_id": null
+  }
+]
