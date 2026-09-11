@@ -141,6 +141,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
     cmd_stop(args)
     time.sleep(0.5)
     args.daemon = True
+    args.reload = getattr(args, "reload", False)
     cmd_start(args)
 
 
@@ -197,8 +198,8 @@ def cmd_sync(args: argparse.Namespace) -> None:
     sync_args = []
     if args.name:
         sync_args.extend(["--name", args.name])
-    if args.accounts:
-        sync_args.extend(["--file", str(args.accounts)])
+    accounts_file = Path(args.accounts).resolve() if args.accounts else settings.accounts_file
+    sync_args.extend(["--file", str(accounts_file)])
     if args.no_validate:
         sync_args.append("--no-validate")
     if args.dry_run:
@@ -353,6 +354,7 @@ def main() -> None:
     p_restart.add_argument("--host", type=str, default=None)
     p_restart.add_argument("--port", type=int, default=None)
     p_restart.add_argument("--accounts", type=str, default=None)
+    p_restart.add_argument("--reload", action="store_true", help="Enable automatic code reload")
 
     # status
     p_status = subparsers.add_parser("status", help="Inspect pool status and account health")

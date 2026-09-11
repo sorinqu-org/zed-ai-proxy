@@ -2,6 +2,7 @@ import html
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, Any
+from app.config import settings
 
 router = APIRouter()
 

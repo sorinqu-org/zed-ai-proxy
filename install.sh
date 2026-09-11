@@ -97,7 +97,10 @@ mkdir -p "${STATE_DIR}"
 mkdir -p "${INSTALL_DIR}"
 
 # 3. Initialize default accounts.json if not present
-if [ ! -f "${CONFIG_DIR}/accounts.json" ]; then
+if [ -f "${INSTALL_DIR}/accounts.json" ] && [ ! -f "${CONFIG_DIR}/accounts.json" ]; then
+    cp "${INSTALL_DIR}/accounts.json" "${CONFIG_DIR}/accounts.json"
+    log_info "Migrated accounts.json from ${INSTALL_DIR} to ${CONFIG_DIR}/accounts.json"
+elif [ ! -f "${CONFIG_DIR}/accounts.json" ]; then
     if [ -f "${SOURCE_DIR}/accounts.json" ]; then
         cp "${SOURCE_DIR}/accounts.json" "${CONFIG_DIR}/accounts.json"
         log_info "Copied existing accounts.json to ${CONFIG_DIR}/accounts.json"
@@ -113,6 +116,7 @@ cp -r "${SOURCE_DIR}/app" "${INSTALL_DIR}/"
 cp -r "${SOURCE_DIR}/scripts" "${INSTALL_DIR}/"
 cp "${SOURCE_DIR}/requirements.txt" "${INSTALL_DIR}/"
 cp "${SOURCE_DIR}/pyproject.toml" "${INSTALL_DIR}/"
+rm -f "${INSTALL_DIR}/accounts.json"
 
 # 5. Create or update virtual environment
 VENV_DIR="${INSTALL_DIR}/venv"

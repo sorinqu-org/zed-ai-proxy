@@ -19,6 +19,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
+# Ensure package root is importable
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+try:
+    from app.config import settings
+except ImportError:
+    settings = None
+
 ZED_CLOUD_URL = os.getenv("ZED_API_URL", "https://cloud.zed.dev").rstrip("/")
 ZED_VERSION = os.getenv("ZED_VERSION", "0.176.0")
 
@@ -229,7 +239,7 @@ def validate_zed_credentials(user_id: str, access_token: str) -> Tuple[bool, str
         return False, f"Connection failed to {ZED_CLOUD_URL}: {e}", None
 
 
-def notify_running_proxy(proxy_url: str) -> bool:
+def notify_running_proxy(proxy_url: str) -> Tuple[bool, str]:
     """Notifies a running proxy instance to hot-reload accounts via /api/refresh."""
     url = f"{proxy_url.rstrip('/')}/api/refresh"
     req = urllib.request.Request(
@@ -240,9 +250,16 @@ def notify_running_proxy(proxy_url: str) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=3.0) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+            data = json.loads(resp.read().decode())
+            active = data.get("summary", {}).get("active_accounts", 0)
+            return True, f"Proxy pool reloaded ({active} active account(s))."
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:100]
+        return False, f"Proxy error HTTP {e.code}: {body}"
+    except urllib.error.URLError:
+        return False, "Proxy is not currently running (offline)."
+    except Exception as e:
+        return False, f"Could not contact proxy: {e}"
 
 
 def upsert_account(
@@ -360,8 +377,15 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    project_root = Path(__file__).resolve().parent.parent
-    accounts_file = args.file or (project_root / "accounts.json")
+    if args.file:
+        accounts_file = Path(args.file).resolve()
+    elif settings is not None:
+        accounts_file = settings.accounts_file
+    elif "ACCOUNTS_FILE" in os.environ:
+        accounts_file = Path(os.environ["ACCOUNTS_FILE"]).resolve()
+    else:
+        project_root = Path(__file__).resolve().parent.parent
+        accounts_file = project_root / "accounts.json"
 
     user_id = args.user_id
     access_token = args.access_token
@@ -418,11 +442,12 @@ def main() -> None:
     print(f"[+] Total accounts in {accounts_file.name}: {tot}")
 
     # Proxy hot-reload notification
-    print(f"[*] Checking for running proxy at {args.proxy_url}...")
-    if notify_running_proxy(args.proxy_url):
-        print(f"[SUCCESS] Successfully notified proxy at {args.proxy_url}/api/refresh (pool hot-reloaded).")
+    print(f"[*] Notifying proxy at {args.proxy_url}...")
+    success, notify_msg = notify_running_proxy(args.proxy_url)
+    if success:
+        print(f"[SUCCESS] {notify_msg}")
     else:
-        print(f"[*] Proxy at {args.proxy_url} is not currently running. Changes will be loaded on next startup.")
+        print(f"[*] {notify_msg}")
 
 
 if __name__ == "__main__":

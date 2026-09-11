@@ -261,9 +261,12 @@ class AccountPool:
                 }
             )
 
-        active_count = sum(1 for a in self.accounts if a.is_available())
+        available_count = sum(1 for a in self.accounts if a.is_available())
+        cooldown_count = sum(1 for a in self.accounts if a.status == "cooldown")
         return {
             "total_accounts": len(self.accounts),
-            "available_accounts": active_count,
+            "available_accounts": available_count,
+            "active_accounts": available_count,
+            "cooldown_accounts": cooldown_count,
             "accounts": accounts_info,
         }
