@@ -129,13 +129,38 @@ cmdkey /list:zed*
 
 ## Установка и быстрый старт
 
-### 1. Клонирование и установка зависимостей
+### 1. Глобальная установка CLI (Bash, Zsh, Fish)
+
+Для установки утилиты `zed-proxy` глобально в систему выполните установочный скрипт:
 
 ```bash
 git clone https://github.com/sorinqu-org/zed-ai-proxy.git
 cd zed-ai-proxy
+./install.sh
+```
+
+Скрипт автоматически:
+- Развернет изолированное окружение в `~/.local/share/zed-ai-proxy`.
+- Установит исполняемый бинарник `zed-proxy` (и алиас `zed-ai-proxy`) в `~/.local/bin`.
+- Настроит `PATH` для оболочек **bash**, **zsh** и **fish**.
+- Установит автодополнение команд (tab completion) для всех трех оболочек.
+
+После установки доступны глобальные команды из любой папки:
+```bash
+zed-proxy sync --name "Мой Zed"   # Импорт/обновление аккаунта из связки ключей
+zed-proxy start -d                # Запуск прокси в фоне как демона
+zed-proxy status                  # Просмотр таблицы статуса и счетчиков запросов
+zed-proxy stop                    # Остановка демона
+zed-proxy logs -f                 # Просмотр логов в реальном времени
+```
+
+---
+
+### 2. Локальный запуск без глобальной установки (альтернатива)
+
+```bash
 python3 -m venv .venv
-source .venv/bin/activate  # На Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 

@@ -47,13 +47,32 @@ Zed AI client communication protocol:
 
 ## Installation & Quickstart
 
-### 1. Clone & Install Dependencies
+### 1. Global CLI Installation (Bash, Zsh, Fish)
+
+Install `zed-proxy` globally to your system with automatic shell integration:
 
 ```bash
 git clone https://github.com/sorinqu-org/zed-ai-proxy.git
 cd zed-ai-proxy
-pip install -r requirements.txt
+./install.sh
 ```
+
+This installer automatically:
+- Creates an isolated virtual environment in `~/.local/share/zed-ai-proxy/venv`.
+- Places executable binary `zed-proxy` (and alias `zed-ai-proxy`) in `~/.local/bin`.
+- Ensures `~/.local/bin` is in `PATH` across **bash**, **zsh**, and **fish**.
+- Installs tab completion scripts for all three shells.
+
+Once installed, use `zed-proxy` from anywhere:
+```bash
+zed-proxy sync --name "Work Zed"   # Import/update credentials from OS keychain
+zed-proxy start -d                 # Start proxy in background as daemon
+zed-proxy status                   # View pool table, accounts, and telemetry
+zed-proxy stop                     # Stop background daemon
+zed-proxy logs -f                  # Follow live daemon logs
+```
+
+---
 
 ### 2. Extract Account Credentials
 
