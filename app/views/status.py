@@ -1,3 +1,4 @@
+import html
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, Any
@@ -31,16 +32,20 @@ async def dashboard(request: Request) -> str:
         if a["status"] == "cooldown":
             status_color = "#f59e0b"
 
+        safe_id = html.escape(str(a["id"]))
+        safe_name = html.escape(str(a["name"]))
+        safe_uid = html.escape(str(a["user_id"]))
+        safe_status = html.escape(str(a["status"]))
         exp_str = f"{a['token_expires_in_seconds']}s" if a["token_expires_in_seconds"] else "None"
         cd_str = f"{a['cooldown_remaining_seconds']}s" if a["cooldown_remaining_seconds"] else "-"
-        last_err = a["last_error"] or "-"
+        last_err = html.escape(str(a["last_error"])) if a["last_error"] else "-"
 
         rows_html += f"""
         <tr>
-            <td>{a['id']}</td>
-            <td>{a['name']}</td>
-            <td>{a['user_id']}</td>
-            <td><span class="badge" style="background:{status_color};">{a['status']}</span></td>
+            <td>{safe_id}</td>
+            <td>{safe_name}</td>
+            <td>{safe_uid}</td>
+            <td><span class="badge" style="background:{status_color};">{safe_status}</span></td>
             <td>{'Yes' if a['has_token'] else 'No'}</td>
             <td>{exp_str}</td>
             <td>{cd_str}</td>
@@ -49,7 +54,7 @@ async def dashboard(request: Request) -> str:
         </tr>
         """
 
-    html = f"""<!DOCTYPE html>
+    html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -184,4 +189,4 @@ async def dashboard(request: Request) -> str:
 </body>
 </html>
 """
-    return html
+    return html_content

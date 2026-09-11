@@ -3,6 +3,8 @@ from app.adapters.openai_adapter import (
     detect_provider,
     openai_to_zed_body,
     parse_zed_chunk_to_openai_delta,
+    normalize_content_text,
+    convert_tools_openai_to_anthropic,
 )
 from app.adapters.anthropic_adapter import (
     anthropic_to_zed_body,
@@ -19,14 +21,30 @@ def test_detect_provider():
     assert detect_provider("grok-build-1") == "x_ai"
 
 
+def test_normalize_content_text():
+    assert normalize_content_text("hello") == "hello"
+    assert normalize_content_text([{"type": "text", "text": "foo"}, {"type": "text", "text": "bar"}]) == "foo\nbar"
+    assert normalize_content_text(None) == ""
+
+
 def test_openai_to_zed_body_anthropic():
     req = {
         "model": "claude-opus-5",
         "messages": [
-            {"role": "system", "content": "Be concise."},
+            {"role": "developer", "content": "Be concise."},
             {"role": "user", "content": "Hi"},
         ],
         "temperature": 0.7,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Weather info",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
     }
     zed_body = openai_to_zed_body(req)
     assert zed_body["provider"] == "anthropic"
@@ -34,19 +52,26 @@ def test_openai_to_zed_body_anthropic():
     assert zed_body["provider_request"]["system"] == "Be concise."
     assert len(zed_body["provider_request"]["messages"]) == 1
     assert zed_body["provider_request"]["messages"][0]["content"] == "Hi"
+    assert zed_body["provider_request"]["tools"][0]["name"] == "get_weather"
+    assert "input_schema" in zed_body["provider_request"]["tools"][0]
 
 
 def test_parse_zed_chunk_to_openai_delta():
-    # Test Anthropic text delta inside Zed chunk
+    # Anthropic text delta inside Zed chunk
     raw = json.dumps({"event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello world"}}})
-    delta_str = parse_zed_chunk_to_openai_delta(raw)
-    assert delta_str is not None
+    res = parse_zed_chunk_to_openai_delta(raw)
+    assert res is not None
+    delta_str, finish = res
     data = json.loads(delta_str)
     assert data["choices"][0]["delta"]["content"] == "Hello world"
+    assert finish is None
 
-    # Test status stream_ended
+    # Status stream_ended
     ended = json.dumps({"status": "stream_ended"})
-    assert parse_zed_chunk_to_openai_delta(ended) == "[DONE]"
+    res_ended = parse_zed_chunk_to_openai_delta(ended)
+    assert res_ended is not None
+    assert res_ended[0] == "[DONE]"
+    assert res_ended[1] == "stop"
 
 
 def test_anthropic_adapter():

@@ -1,8 +1,11 @@
 import asyncio
 import json
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +16,7 @@ from app.adapters.anthropic_adapter import (
     parse_zed_chunk_to_anthropic_event,
 )
 from app.adapters.openai_adapter import (
+    make_openai_chunk,
     openai_to_zed_body,
     parse_zed_chunk_to_openai_delta,
 )
@@ -34,7 +38,6 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Initializing Zed AI Proxy...")
     pool.load_from_file(settings.accounts_file)
-    # If no accounts loaded and example exists, log notice
     if not pool.accounts:
         example_path = settings.accounts_file.parent / "accounts.example.json"
         if example_path.exists():
@@ -42,11 +45,17 @@ async def lifespan(app: FastAPI):
             pool.load_from_file(example_path)
 
     app.state.pool = pool
+    app.state.client = httpx.AsyncClient(
+        timeout=120.0,
+        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200),
+    )
     await pool.start_background_loop()
     yield
     # Shutdown
-    logger.info("Stopping background token refresher...")
-    pool.stop_background_loop()
+    logger.info("Tearing down Zed AI Proxy...")
+    await pool.stop_background_loop()
+    if hasattr(app.state, "client") and app.state.client:
+        await app.state.client.aclose()
 
 
 app = FastAPI(
@@ -56,12 +65,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Attach pool immediately for lightweight/test environments
 app.state.pool = pool
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -69,35 +79,59 @@ app.add_middleware(
 app.include_router(status_router)
 
 
+@app.exception_handler(HTTPException)
+async def standard_http_exception_handler(request: Request, exc: HTTPException):
+    """Returns standard RFC-compliant error format expected by OpenAI and Anthropic SDKs."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "message": str(exc.detail),
+                "type": "invalid_request_error" if exc.status_code < 500 else "api_error",
+                "code": exc.status_code,
+            }
+        },
+    )
+
+
+MODELS_METADATA = [
+    {"id": "claude-opus-5", "object": "model", "owned_by": "zed"},
+    {"id": "claude-sonnet-5", "object": "model", "owned_by": "zed"},
+    {"id": "claude-haiku-4-5", "object": "model", "owned_by": "zed"},
+    {"id": "claude-fable-5", "object": "model", "owned_by": "zed"},
+    {"id": "gpt-5.6-luna", "object": "model", "owned_by": "zed"},
+    {"id": "gpt-5.6-sol", "object": "model", "owned_by": "zed"},
+    {"id": "gemini-3.1-pro", "object": "model", "owned_by": "zed"},
+    {"id": "gemini-3-flash", "object": "model", "owned_by": "zed"},
+]
+
+
 @app.get("/v1/models")
 async def list_models() -> Dict[str, Any]:
-    """Returns models supported by Zed AI."""
-    models_list = [
-        {"id": "claude-opus-5", "object": "model", "owned_by": "zed"},
-        {"id": "claude-sonnet-5", "object": "model", "owned_by": "zed"},
-        {"id": "claude-haiku-4-5", "object": "model", "owned_by": "zed"},
-        {"id": "claude-fable-5", "object": "model", "owned_by": "zed"},
-        {"id": "gpt-5.6-luna", "object": "model", "owned_by": "zed"},
-        {"id": "gpt-5.6-sol", "object": "model", "owned_by": "zed"},
-        {"id": "gemini-3.1-pro", "object": "model", "owned_by": "zed"},
-        {"id": "gemini-3-flash", "object": "model", "owned_by": "zed"},
-    ]
-    return {"object": "list", "data": models_list}
+    return {"object": "list", "data": MODELS_METADATA}
+
+
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str) -> Dict[str, Any]:
+    for m in MODELS_METADATA:
+        if m["id"] == model_id:
+            return m
+    raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
 
 async def forward_to_zed_cloud(
     zed_body: Dict[str, Any],
     pool: AccountPool,
+    client: Optional[httpx.AsyncClient] = None,
     max_retries: int = 3,
-) -> Tuple[httpx.Response, httpx.AsyncClient, Account]:
-    """Handles sending completion request to Zed with auto-failover across accounts."""
-    client = httpx.AsyncClient(timeout=120.0)
+) -> Tuple[httpx.Response, Account]:
+    """Forward completion request to Zed Cloud with automatic account failover."""
+    http_client = client or httpx.AsyncClient(timeout=120.0)
     retries = 0
 
     while retries < max_retries:
         account = await pool.get_next_account()
         if not account:
-            await client.aclose()
             raise HTTPException(
                 status_code=503,
                 detail="No available Zed accounts in pool (all in cooldown or unauthorized)",
@@ -114,20 +148,19 @@ async def forward_to_zed_cloud(
 
         url = f"{settings.zed_api_url}/completions"
         try:
-            req = client.build_request("POST", url, headers=headers, json=zed_body)
-            resp = await client.send(req, stream=True)
+            req = http_client.build_request("POST", url, headers=headers, json=zed_body)
+            resp = await http_client.send(req, stream=True)
 
-            # Check rate limiting
+            # 429 Rate Limit
             if resp.status_code == 429:
                 await resp.aclose()
                 pool.mark_rate_limited(account.id)
                 retries += 1
                 continue
 
-            # Check token expiration / unauthorized
+            # 401 Unauthorized or Token Expired
             if resp.status_code == 401 or "x-zed-expired-token" in resp.headers:
                 await resp.aclose()
-                # Try refresh
                 try:
                     res = await pool.refresher.fetch_llm_token(
                         account.user_id, account.access_token, account.organization_id
@@ -139,80 +172,129 @@ async def forward_to_zed_cloud(
                 retries += 1
                 continue
 
+            # Upstream error (5xx or client 4xx)
             if resp.status_code >= 400:
                 body_err = await resp.aread()
                 await resp.aclose()
-                pool.mark_rate_limited(account.id, cooldown_seconds=10)
+                # DO NOT penalize account on client-side errors (400, 404, 422)
+                if resp.status_code >= 500:
+                    pool.mark_rate_limited(account.id, cooldown_seconds=15)
+
+                err_msg = body_err.decode("utf-8", errors="ignore")[:300]
                 raise HTTPException(
                     status_code=resp.status_code,
-                    detail=f"Zed Cloud error: {body_err.decode('utf-8', errors='ignore')}",
+                    detail=f"Zed Cloud error: {err_msg}",
                 )
 
             pool.mark_success(account.id)
-            return resp, client, account
+            return resp, account
 
         except httpx.RequestError as e:
             logger.error(f"Network error contacting Zed Cloud for account {account.id}: {e}")
             retries += 1
             if retries >= max_retries:
-                await client.aclose()
                 raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
 
-    await client.aclose()
     raise HTTPException(status_code=504, detail="Exhausted retries across Zed accounts")
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Response:
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+
     stream = body.get("stream", False)
+    model = body.get("model", "claude-sonnet-5")
+    req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     zed_body = openai_to_zed_body(body)
 
-    resp, client, account = await forward_to_zed_cloud(zed_body, pool)
+    shared_client = getattr(request.app.state, "client", None)
+    resp, account = await forward_to_zed_cloud(zed_body, pool, client=shared_client)
+
+    sse_headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
 
     if stream:
         async def event_generator() -> AsyncGenerator[bytes, None]:
+            role_sent = False
+            done_sent = False
             try:
+                # 1. First chunk establishes role: assistant
+                initial_chunk = make_openai_chunk(req_id, model, {"role": "assistant"})
+                yield f"data: {initial_chunk}\n\n".encode("utf-8")
+                role_sent = True
+
                 async for line in resp.aiter_lines():
-                    delta = parse_zed_chunk_to_openai_delta(line)
-                    if delta:
-                        if delta == "[DONE]":
+                    parsed = parse_zed_chunk_to_openai_delta(line, req_id=req_id, model=model)
+                    if parsed:
+                        delta_str, finish_reason = parsed
+                        if delta_str == "[DONE]":
+                            # Emit terminal chunk if not yet sent
+                            term_chunk = make_openai_chunk(req_id, model, {}, finish_reason="stop")
+                            yield f"data: {term_chunk}\n\n".encode("utf-8")
                             yield b"data: [DONE]\n\n"
+                            done_sent = True
                             break
-                        yield f"data: {delta}\n\n".encode("utf-8")
+                        yield f"data: {delta_str}\n\n".encode("utf-8")
+
+                if not done_sent:
+                    term_chunk = make_openai_chunk(req_id, model, {}, finish_reason="stop")
+                    yield f"data: {term_chunk}\n\n".encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+
             finally:
                 await resp.aclose()
-                await client.aclose()
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(event_generator(), headers=sse_headers)
     else:
         # Non-streaming collection
         full_text = ""
+        tool_calls: List[Dict[str, Any]] = []
+        finish_reason = "stop"
+
         try:
             async for line in resp.aiter_lines():
-                delta = parse_zed_chunk_to_openai_delta(line)
-                if delta and delta != "[DONE]":
-                    try:
-                        d_obj = json.loads(delta)
-                        choice = d_obj.get("choices", [{}])[0]
-                        full_text += choice.get("delta", {}).get("content", "")
-                    except Exception:
-                        pass
+                parsed = parse_zed_chunk_to_openai_delta(line, req_id=req_id, model=model)
+                if parsed:
+                    delta_str, f_reason = parsed
+                    if f_reason:
+                        finish_reason = f_reason
+                    if delta_str and delta_str != "[DONE]":
+                        try:
+                            d_obj = json.loads(delta_str)
+                            choice = d_obj.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+                            if "content" in delta:
+                                full_text += delta.get("content") or ""
+                            if "tool_calls" in delta:
+                                tool_calls.extend(delta.get("tool_calls") or [])
+                        except Exception:
+                            pass
         finally:
             await resp.aclose()
-            await client.aclose()
+
+        msg_payload: Dict[str, Any] = {"role": "assistant", "content": full_text}
+        if tool_calls:
+            msg_payload["tool_calls"] = tool_calls
+            finish_reason = "tool_calls"
 
         return JSONResponse(
             {
-                "id": "chatcmpl-zed",
+                "id": req_id,
                 "object": "chat.completion",
-                "created": 1700000000,
-                "model": body.get("model", "zed-model"),
+                "created": int(time.time()),
+                "model": model,
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": full_text},
-                        "finish_reason": "stop",
+                        "message": msg_payload,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -222,14 +304,28 @@ async def chat_completions(request: Request) -> Response:
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request) -> Response:
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+
     stream = body.get("stream", False)
+    model = body.get("model", "claude-sonnet-5")
     zed_body = anthropic_to_zed_body(body)
 
-    resp, client, account = await forward_to_zed_cloud(zed_body, pool)
+    shared_client = getattr(request.app.state, "client", None)
+    resp, account = await forward_to_zed_cloud(zed_body, pool, client=shared_client)
+
+    sse_headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
 
     if stream:
         async def event_generator() -> AsyncGenerator[bytes, None]:
+            done_sent = False
             try:
                 async for line in resp.aiter_lines():
                     parsed = parse_zed_chunk_to_anthropic_event(line)
@@ -237,38 +333,86 @@ async def anthropic_messages(request: Request) -> Response:
                         event_type, event_data = parsed
                         yield f"event: {event_type}\ndata: {event_data}\n\n".encode("utf-8")
                         if event_type == "message_stop":
+                            done_sent = True
                             break
+
+                if not done_sent:
+                    yield b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
             finally:
                 await resp.aclose()
-                await client.aclose()
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(event_generator(), headers=sse_headers)
     else:
         # Non-streaming collection
         full_text = ""
+        stop_reason = "end_turn"
+        tool_calls: List[Dict[str, Any]] = []
+        msg_id = f"msg_{uuid.uuid4().hex[:16]}"
+        input_tokens = 0
+        output_tokens = 0
+
         try:
             async for line in resp.aiter_lines():
                 parsed = parse_zed_chunk_to_anthropic_event(line)
                 if parsed:
                     event_type, event_data = parsed
-                    if event_type == "content_block_delta":
-                        try:
-                            d_obj = json.loads(event_data)
-                            full_text += d_obj.get("delta", {}).get("text", "")
-                        except Exception:
-                            pass
+                    try:
+                        d_obj = json.loads(event_data)
+                    except Exception:
+                        d_obj = {}
+
+                    if event_type == "message_start":
+                        msg_info = d_obj.get("message", {})
+                        if "id" in msg_info:
+                            msg_id = msg_info["id"]
+                        usage = msg_info.get("usage", {})
+                        input_tokens = usage.get("input_tokens", 0)
+
+                    elif event_type == "content_block_start":
+                        cb = d_obj.get("content_block", {})
+                        if cb.get("type") == "tool_use":
+                            tool_calls.append(
+                                {
+                                    "type": "tool_use",
+                                    "id": cb.get("id"),
+                                    "name": cb.get("name"),
+                                    "input": {},
+                                }
+                            )
+
+                    elif event_type == "content_block_delta":
+                        delta = d_obj.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            full_text += delta.get("text", "")
+                        elif delta.get("type") == "input_json_delta":
+                            # Partial json for tool calls
+                            if tool_calls:
+                                pass
+
+                    elif event_type == "message_delta":
+                        delta_info = d_obj.get("delta", {})
+                        if "stop_reason" in delta_info:
+                            stop_reason = delta_info["stop_reason"]
+                        usage = d_obj.get("usage", {})
+                        output_tokens = usage.get("output_tokens", 0)
+
         finally:
             await resp.aclose()
-            await client.aclose()
+
+        content_list: List[Dict[str, Any]] = []
+        if full_text:
+            content_list.append({"type": "text", "text": full_text})
+        if tool_calls:
+            content_list.extend(tool_calls)
 
         return JSONResponse(
             {
-                "id": "msg_zed",
+                "id": msg_id,
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "text", "text": full_text}],
-                "model": body.get("model", "claude-sonnet-5"),
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "content": content_list if content_list else [{"type": "text", "text": ""}],
+                "model": model,
+                "stop_reason": stop_reason,
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
             }
         )

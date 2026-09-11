@@ -4,7 +4,7 @@ import logging
 import time
 from pathlib import Path
 from typing import List, Dict, Optional, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.config import settings
 from app.core.token_refresher import TokenRefresher
@@ -34,9 +34,9 @@ class Account(BaseModel):
         if self.status == "cooldown":
             if self.cooldown_until and time.time() < self.cooldown_until:
                 return False
-            # Cooldown expired, restore active
             self.status = "active"
             self.cooldown_until = None
+            return True
         return True
 
     def is_token_expiring(self, threshold_seconds: int = 300) -> bool:
@@ -52,6 +52,7 @@ class AccountPool:
         self._lock = asyncio.Lock()
         self.refresher = token_refresher or TokenRefresher()
         self._bg_task: Optional[asyncio.Task] = None
+        self._refresh_tasks: Dict[str, asyncio.Task] = {}
 
     def load_from_file(self, path: Path) -> None:
         if not path.exists():
@@ -67,7 +68,7 @@ class AccountPool:
 
     def load_from_dict(self, data: Any) -> None:
         raw_list = data if isinstance(data, list) else data.get("accounts", [])
-        self.accounts = []
+        new_accounts = []
         for i, item in enumerate(raw_list):
             acc_id = str(item.get("id") or item.get("user_id") or f"acc-{i+1}")
             account = Account(
@@ -80,53 +81,76 @@ class AccountPool:
                 expires_at=item.get("expires_at"),
                 status=item.get("status", "active"),
             )
-            self.accounts.append(account)
+            new_accounts.append(account)
+        self.accounts = new_accounts
+
+    async def _ensure_token_refreshed(self, account: Account) -> bool:
+        """Deduplicated token refresh per account outside of the global pool lock."""
+        account_id = account.id
+
+        # If a refresh task is already in-flight for this account, await it (thundering herd defense)
+        if account_id in self._refresh_tasks:
+            try:
+                await self._refresh_tasks[account_id]
+                return bool(account.current_llm_token and not account.is_token_expiring(settings.token_refresh_threshold_seconds))
+            except Exception:
+                return False
+
+        async def _do_refresh():
+            try:
+                res = await self.refresher.fetch_llm_token(
+                    account.user_id, account.access_token, account.organization_id
+                )
+                account.current_llm_token = res["token"]
+                account.expires_at = res["expires_at"]
+                account.status = "active"
+                account.last_error = None
+                return True
+            except Exception as e:
+                logger.error(f"Failed to refresh token for account {account.id}: {e}")
+                account.last_error = str(e)
+                return False
+            finally:
+                self._refresh_tasks.pop(account_id, None)
+
+        task = asyncio.create_task(_do_refresh())
+        self._refresh_tasks[account_id] = task
+        return await task
 
     async def get_next_account(self) -> Optional[Account]:
-        """Round-robin selection of an available account with valid LLM token."""
-        async with self._lock:
-            if not self.accounts:
-                return None
+        """Iterative, non-blocking round-robin selection of an account with valid token."""
+        for _ in range(max(1, len(self.accounts))):
+            account = None
+            async with self._lock:
+                if not self.accounts:
+                    return None
 
-            available = [a for a in self.accounts if a.is_available()]
-            if not available:
-                # Check if all accounts are in cooldown; return earliest recovering account
-                cooldowns = [a for a in self.accounts if a.status == "cooldown" and a.cooldown_until]
-                if cooldowns:
-                    cooldowns.sort(key=lambda a: a.cooldown_until or 0)
-                    earliest = cooldowns[0]
-                    wait_time = (earliest.cooldown_until or 0) - time.time()
-                    if wait_time <= 5.0:
-                        # Small wait, let it recover
-                        await asyncio.sleep(max(0.1, wait_time))
-                        earliest.status = "active"
-                        earliest.cooldown_until = None
-                        return earliest
-                return None
+                # Reset cooldown if expired
+                now = time.time()
+                for a in self.accounts:
+                    if a.status == "cooldown" and a.cooldown_until and now >= a.cooldown_until:
+                        a.status = "active"
+                        a.cooldown_until = None
 
-            # Pick next round-robin
-            self._current_index = (self._current_index + 1) % len(available)
-            account = available[self._current_index]
-            account.last_used = time.time()
-            account.total_requests += 1
+                available = [a for a in self.accounts if a.is_available()]
+                if not available:
+                    return None
 
-            # Ensure token is valid
+                self._current_index = (self._current_index + 1) % len(available)
+                account = available[self._current_index]
+                account.last_used = now
+                account.total_requests += 1
+
+            # Network I/O and refresh happen OUTSIDE the global lock
             if account.is_token_expiring(settings.token_refresh_threshold_seconds):
-                try:
-                    res = await self.refresher.fetch_llm_token(
-                        account.user_id, account.access_token, account.organization_id
-                    )
-                    account.current_llm_token = res["token"]
-                    account.expires_at = res["expires_at"]
-                    account.status = "active"
-                except Exception as e:
-                    logger.error(f"Failed to refresh token for account {account.id}: {e}")
-                    account.last_error = str(e)
-                    # If this one fails, try another account
-                    if len(available) > 1:
-                        return await self.get_next_account()
+                success = await self._ensure_token_refreshed(account)
+                if not success:
+                    # Token refresh failed, continue loop to try another account
+                    continue
 
             return account
+
+        return None
 
     def mark_rate_limited(self, account_id: str, cooldown_seconds: Optional[int] = None) -> None:
         cd = cooldown_seconds or settings.rate_limit_cooldown_seconds
@@ -157,35 +181,39 @@ class AccountPool:
 
     async def refresh_all_tokens(self) -> None:
         """Periodic background worker to refresh expiring tokens."""
+        tasks = []
         for a in self.accounts:
-            if a.status == "unauthorized" or a.status == "disabled":
+            if a.status in ("unauthorized", "disabled"):
                 continue
             if a.is_token_expiring(settings.token_refresh_threshold_seconds):
-                try:
-                    res = await self.refresher.fetch_llm_token(
-                        a.user_id, a.access_token, a.organization_id
-                    )
-                    a.current_llm_token = res["token"]
-                    a.expires_at = res["expires_at"]
-                    logger.info(f"Refreshed token for account {a.id}, expires at {a.expires_at}")
-                except Exception as e:
-                    logger.error(f"Background refresh failed for {a.id}: {e}")
-                    a.last_error = str(e)
+                tasks.append(self._ensure_token_refreshed(a))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def start_background_loop(self) -> None:
+        if self._bg_task and not self._bg_task.done():
+            return
+
         async def _loop():
             while True:
                 try:
                     await self.refresh_all_tokens()
+                except asyncio.CancelledError:
+                    break
                 except Exception as e:
                     logger.error(f"Error in token refresher loop: {e}")
                 await asyncio.sleep(settings.token_refresh_interval_seconds)
 
         self._bg_task = asyncio.create_task(_loop())
 
-    def stop_background_loop(self) -> None:
+    async def stop_background_loop(self) -> None:
         if self._bg_task:
             self._bg_task.cancel()
+            try:
+                await self._bg_task
+            except asyncio.CancelledError:
+                pass
+            self._bg_task = None
 
     def get_status_summary(self) -> Dict[str, Any]:
         now = time.time()

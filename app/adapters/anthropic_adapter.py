@@ -3,6 +3,7 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from app.adapters.payload_filter import filter_payload
+from app.adapters.openai_adapter import detect_provider
 
 logger = logging.getLogger("zed_proxy.anthropic_adapter")
 
@@ -10,13 +11,14 @@ logger = logging.getLogger("zed_proxy.anthropic_adapter")
 def anthropic_to_zed_body(req: Dict[str, Any]) -> Dict[str, Any]:
     """Converts an Anthropic /v1/messages request into a Zed CompletionBody."""
     model = req.get("model", "claude-sonnet-5")
+    provider = detect_provider(model)
     provider_req = dict(req)
     if "messages" in provider_req:
         provider_req["messages"] = filter_payload(provider_req["messages"])
     provider_req["stream"] = True
 
     return {
-        "provider": "anthropic",
+        "provider": provider,
         "model": model,
         "provider_request": provider_req,
     }

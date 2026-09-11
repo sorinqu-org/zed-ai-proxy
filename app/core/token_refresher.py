@@ -56,9 +56,10 @@ class TokenRefresher:
                 resp = await _do_post(c)
 
         if resp.status_code != 200:
+            safe_err = resp.text.replace("\n", " ").replace("\r", " ")[:200]
             logger.error(
                 f"Failed to fetch LLM token for user_id={user_id}: "
-                f"HTTP {resp.status_code} - {resp.text}"
+                f"HTTP {resp.status_code} - {safe_err}"
             )
             resp.raise_for_status()
 
