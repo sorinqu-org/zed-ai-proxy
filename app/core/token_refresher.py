@@ -36,7 +36,7 @@ class TokenRefresher:
         organization_id: Optional[str] = None,
         client: Optional[httpx.AsyncClient] = None,
     ) -> Dict[str, Any]:
-        """Calls POST /client/llm_tokens on api.zed.dev to obtain an ephemeral LLM token."""
+        """Calls POST /client/llm_tokens on cloud.zed.dev to obtain an ephemeral LLM token."""
         url = f"{self.zed_api_url}/client/llm_tokens"
         headers = {
             "Authorization": f"{user_id} {access_token}",

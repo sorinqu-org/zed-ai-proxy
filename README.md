@@ -4,6 +4,8 @@ High-performance asynchronous reverse proxy that unlocks Zed AI subscription mod
 
 Built with FastAPI, HTTPX, and native token pooling.
 
+[English](README.md) | [Русский](README.ru.md)
+
 ---
 
 ## Features
@@ -20,8 +22,8 @@ Built with FastAPI, HTTPX, and native token pooling.
 ## Architecture
 
 Zed AI client communication protocol:
-1. `POST https://api.zed.dev/client/llm_tokens` with header `Authorization: <user_id> <access_token>` returns an ephemeral JWT LLM token.
-2. `POST https://api.zed.dev/completions` with header `Authorization: Bearer <llm_token>` streams model completions.
+1. `POST https://cloud.zed.dev/client/llm_tokens` with header `Authorization: <user_id> <access_token>` returns an ephemeral JWT LLM token.
+2. `POST https://cloud.zed.dev/models/...` with header `Authorization: Bearer <llm_token>` streams model completions.
 
 `zed-ai-proxy` manages this lifecycle transparently:
 
@@ -35,7 +37,7 @@ Zed AI client communication protocol:
       |-- PayloadFilter (Image & size defense)
             |
             v  (Zed Cloud Protocol)
-    [ api.zed.dev Gateway ]
+    [ cloud.zed.dev Gateway ]
             |
             v
  [ Claude Opus 5 / Sonnet 5 / GPT-5.6 ]
@@ -53,7 +55,30 @@ cd zed-ai-proxy
 pip install -r requirements.txt
 ```
 
-### 2. Configure Accounts
+### 2. Extract Account Credentials
+
+Zed signs in via GitHub OAuth and stores credentials in your operating system's native keychain:
+
+- **Linux (`secret-tool`):**
+  ```bash
+  secret-tool search url "https://zed.dev"
+  ```
+  Look for:
+  - `attribute.username = 1059832` -> this is your `user_id`
+  - `secret = {"version":2,...}` -> this is your `access_token`
+  (Or check **Passwords and Keys / Seahorse** under `zed-github-account`).
+
+- **macOS (`security`):**
+  ```bash
+  security find-internet-password -s "https://zed.dev" -g
+  ```
+  Look for `acct` (`user_id`) and `password` (`access_token`), or check **Keychain Access.app**.
+
+- **Windows (Credential Manager):**
+  Open `control keymgr.dll` -> **Windows Credentials** -> **Generic Credentials** -> `zed:url=https://zed.dev`.
+  User name is `user_id`, and clicking **Show** next to password gives your `access_token`.
+
+### 3. Configure Accounts
 
 Copy the template:
 ```bash
@@ -66,21 +91,14 @@ Add your Zed account credentials:
   {
     "id": "acc-1",
     "name": "Zed Main",
-    "user_id": "12345",
-    "access_token": "your_zed_access_token_1",
-    "organization_id": null
-  },
-  {
-    "id": "acc-2",
-    "name": "Zed Backup",
-    "user_id": "67890",
-    "access_token": "your_zed_access_token_2",
+    "user_id": "1059832",
+    "access_token": "{\"version\":2,\"id\":\"client_token_...\",\"token\":\"...\"}",
     "organization_id": null
   }
 ]
 ```
 
-### 3. Run the Proxy
+### 4. Run the Proxy
 
 ```bash
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8080

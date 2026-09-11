@@ -71,11 +71,13 @@ class AccountPool:
         new_accounts = []
         for i, item in enumerate(raw_list):
             acc_id = str(item.get("id") or item.get("user_id") or f"acc-{i+1}")
+            raw_tok = item.get("access_token", "")
+            tok_str = json.dumps(raw_tok) if isinstance(raw_tok, dict) else str(raw_tok)
             account = Account(
                 id=acc_id,
                 name=item.get("name", f"Account-{acc_id}"),
                 user_id=str(item.get("user_id", "")),
-                access_token=str(item.get("access_token", "")),
+                access_token=tok_str,
                 organization_id=item.get("organization_id"),
                 current_llm_token=item.get("current_llm_token"),
                 expires_at=item.get("expires_at"),
