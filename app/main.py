@@ -23,6 +23,7 @@ from app.adapters.openai_adapter import (
 from app.adapters.responses_adapter import responses_to_zed_body
 from app.config import settings
 from app.core.account_pool import Account, AccountPool
+from app.core.security import security_policy
 from app.views.status import router as status_router
 
 logging.basicConfig(
@@ -219,6 +220,11 @@ async def chat_completions(request: Request) -> Response:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON in request body")
 
+    security_policy.verify_client_auth(request)
+    body = security_policy.sanitize_request_tools(body)
+    if settings.strict_isolation:
+        body = security_policy.inject_isolation_prompt(body)
+
     stream = body.get("stream", False)
     model = body.get("model", "claude-sonnet-5")
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -238,6 +244,7 @@ async def chat_completions(request: Request) -> Response:
         async def event_generator() -> AsyncGenerator[bytes, None]:
             role_sent = False
             done_sent = False
+            full_text = ""
             try:
                 # 1. First chunk establishes role: assistant
                 initial_chunk = make_openai_chunk(req_id, model, {"role": "assistant"})
@@ -255,6 +262,13 @@ async def chat_completions(request: Request) -> Response:
                             yield b"data: [DONE]\n\n"
                             done_sent = True
                             break
+                        try:
+                            d_obj = json.loads(delta_str)
+                            c = d_obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if c:
+                                full_text += c
+                        except Exception:
+                            pass
                         yield f"data: {delta_str}\n\n".encode("utf-8")
 
                 if not done_sent:
@@ -263,6 +277,9 @@ async def chat_completions(request: Request) -> Response:
                     yield b"data: [DONE]\n\n"
 
             finally:
+                in_tok = max(1, len(json.dumps(body)) // 4)
+                out_tok = max(1, len(full_text) // 4)
+                account.record_usage(in_tok, out_tok, model)
                 await resp.aclose()
 
         return StreamingResponse(event_generator(), headers=sse_headers)
@@ -293,6 +310,10 @@ async def chat_completions(request: Request) -> Response:
         finally:
             await resp.aclose()
 
+        in_tok = max(1, len(json.dumps(body)) // 4)
+        out_tok = max(1, len(full_text) // 4)
+        account.record_usage(in_tok, out_tok, model)
+
         msg_payload: Dict[str, Any] = {"role": "assistant", "content": full_text}
         if tool_calls:
             msg_payload["tool_calls"] = tool_calls
@@ -311,7 +332,11 @@ async def chat_completions(request: Request) -> Response:
                         "finish_reason": finish_reason,
                     }
                 ],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": {
+                    "prompt_tokens": in_tok,
+                    "completion_tokens": out_tok,
+                    "total_tokens": in_tok + out_tok,
+                },
             }
         )
 
@@ -323,6 +348,11 @@ async def anthropic_messages(request: Request) -> Response:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+
+    security_policy.verify_client_auth(request)
+    body = security_policy.sanitize_request_tools(body)
+    if settings.strict_isolation:
+        body = security_policy.inject_isolation_prompt(body)
 
     stream = body.get("stream", False)
     model = body.get("model", "claude-sonnet-5")
@@ -341,11 +371,13 @@ async def anthropic_messages(request: Request) -> Response:
     if stream:
         async def event_generator() -> AsyncGenerator[bytes, None]:
             done_sent = False
+            total_chars = 0
             try:
                 async for line in resp.aiter_lines():
                     parsed = parse_zed_chunk_to_anthropic_event(line)
                     if parsed:
                         event_type, event_data = parsed
+                        total_chars += len(event_data)
                         yield f"event: {event_type}\ndata: {event_data}\n\n".encode("utf-8")
                         if event_type == "message_stop":
                             done_sent = True
@@ -354,6 +386,9 @@ async def anthropic_messages(request: Request) -> Response:
                 if not done_sent:
                     yield b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
             finally:
+                in_tok = max(1, len(json.dumps(body)) // 4)
+                out_tok = max(1, total_chars // 8)
+                account.record_usage(in_tok, out_tok, model)
                 await resp.aclose()
 
         return StreamingResponse(event_generator(), headers=sse_headers)
@@ -414,6 +449,10 @@ async def anthropic_messages(request: Request) -> Response:
         finally:
             await resp.aclose()
 
+        in_tok = input_tokens or max(1, len(json.dumps(body)) // 4)
+        out_tok = output_tokens or max(1, len(full_text) // 4)
+        account.record_usage(in_tok, out_tok, model)
+
         content_list: List[Dict[str, Any]] = []
         if full_text:
             content_list.append({"type": "text", "text": full_text})
@@ -440,6 +479,11 @@ async def responses_endpoint(request: Request) -> Response:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+
+    security_policy.verify_client_auth(request)
+    body = security_policy.sanitize_request_tools(body)
+    if settings.strict_isolation:
+        body = security_policy.inject_isolation_prompt(body)
 
     stream = body.get("stream", True)
     model = body.get("model", "claude-sonnet-5")
@@ -566,6 +610,9 @@ async def responses_endpoint(request: Request) -> Response:
                 yield f"event: response.completed\ndata: {json.dumps(ev_completed)}\n\n".encode("utf-8")
 
             finally:
+                in_tok = max(1, len(json.dumps(body)) // 4)
+                out_tok = max(1, len(full_text) // 4)
+                account.record_usage(in_tok, out_tok, model)
                 await resp.aclose()
 
         return StreamingResponse(event_generator(), headers=sse_headers)
@@ -587,6 +634,10 @@ async def responses_endpoint(request: Request) -> Response:
         finally:
             await resp.aclose()
 
+        in_tok = max(1, len(json.dumps(body)) // 4)
+        out_tok = max(1, len(full_text) // 4)
+        account.record_usage(in_tok, out_tok, model)
+
         return JSONResponse({
             "id": resp_id,
             "object": "response",
@@ -601,6 +652,6 @@ async def responses_endpoint(request: Request) -> Response:
                     "content": [{"type": "text", "text": full_text}],
                 }
             ],
-            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "usage": {"input_tokens": in_tok, "output_tokens": out_tok, "total_tokens": in_tok + out_tok},
         })
 

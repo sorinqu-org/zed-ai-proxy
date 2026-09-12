@@ -156,18 +156,28 @@ def cmd_status(args: argparse.Namespace) -> None:
     else:
         print("Daemon: NOT RUNNING as background daemon")
 
+    headers = {"Accept": "application/json"}
+    if settings.admin_key:
+        headers["x-admin-key"] = settings.admin_key
+
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:
         print(f"[!] Proxy HTTP server is offline or unreachable at {url}: {e}")
         return
 
+    tot_bal = data.get("total_balance_remaining", 0.0)
+    tot_lim = data.get("total_spend_limit", 0.0)
+    tot_spent = data.get("total_spend_used", 0.0)
+    tot_toks = data.get("total_tokens_used", 0)
+    pct = (tot_bal / tot_lim * 100.0) if tot_lim > 0 else 0.0
+
     print(f"Proxy Endpoint: http://{host}:{port}")
-    print(f"Total Accounts: {data.get('total_accounts', 0)}")
-    print(f"Active:         {data.get('active_accounts', 0)}")
-    print(f"In Cooldown:    {data.get('cooldown_accounts', 0)}")
+    print(f"Total Accounts: {data.get('total_accounts', 0)} | Active: {data.get('active_accounts', 0)} | In Cooldown: {data.get('cooldown_accounts', 0)}")
+    print(f"Total Balance:  ${tot_bal:.2f} / ${tot_lim:.2f} remaining ({pct:.1f}%)")
+    print(f"Total Tokens:   {tot_toks:,} tokens used (Est. spend: ${tot_spent:.4f})")
     print("")
 
     accounts = data.get("accounts", [])
@@ -176,21 +186,35 @@ def cmd_status(args: argparse.Namespace) -> None:
         return
 
     # Table format
-    header = f"{'ID':<8} {'Name':<20} {'User ID':<12} {'Status':<10} {'Expires':<10} {'Cooldown':<10} {'Reqs (OK/Tot)':<14} {'Last Error'}"
+    header = f"{'ID':<8} {'Name':<18} {'Plan/Org':<20} {'Balance':<18} {'Tokens':<10} {'Status':<9} {'Expires':<9} {'Reqs (OK/Tot)'}"
     print(header)
-    print("-" * 105)
+    print("-" * 106)
+    billing_links = []
     for a in accounts:
         aid = str(a.get("id", ""))[:7]
-        name = str(a.get("name", ""))[:19]
-        uid = str(a.get("user_id", ""))[:11]
-        stat = str(a.get("status", ""))[:9]
+        name = str(a.get("name", ""))[:17]
+        plan = a.get("plan") or "zed_pro"
+        org = a.get("org_name") or ""
+        plan_org = f"{plan} ({org})" if org else plan
+        plan_org = plan_org[:19]
+        bal = a.get("balance_remaining", 0.0)
+        lim = a.get("spend_limit", 10.0)
+        bal_str = f"${bal:.2f}/${lim:.2f}"
+        toks = f"{a.get('tokens_used', 0):,}"[:9]
+        stat = str(a.get("status", ""))[:8]
         exp_sec = a.get("token_expires_in_seconds")
         exp = f"{exp_sec}s" if exp_sec is not None else "None"
-        cd_sec = a.get("cooldown_remaining_seconds")
-        cd = f"{cd_sec}s" if cd_sec else "-"
         reqs = f"{a.get('successful_requests', 0)}/{a.get('total_requests', 0)}"
-        err = str(a.get("last_error") or "-")[:25]
-        print(f"{aid:<8} {name:<20} {uid:<12} {stat:<10} {exp:<10} {cd:<10} {reqs:<14} {err}")
+        print(f"{aid:<8} {name:<18} {plan_org:<20} {bal_str:<18} {toks:<10} {stat:<9} {exp:<9} {reqs}")
+
+        b_url = a.get("billing_url")
+        if b_url:
+            billing_links.append((aid, b_url))
+
+    if billing_links:
+        print("\nZed Dashboard Billing & Usage URLs:")
+        for aid, burl in billing_links:
+            print(f"  [{aid}] {burl}")
 
 
 def cmd_sync(args: argparse.Namespace) -> None:

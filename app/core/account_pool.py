@@ -8,6 +8,13 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.core.token_refresher import TokenRefresher
+from app.core.billing import (
+    build_billing_url,
+    calculate_cost,
+    fetch_zed_account_details,
+    fetch_live_orb_billing,
+    PLAN_DEFAULT_LIMITS,
+)
 
 logger = logging.getLogger("zed_proxy.account_pool")
 
@@ -18,6 +25,17 @@ class Account(BaseModel):
     user_id: str
     access_token: str
     organization_id: Optional[str] = None
+    org_name: Optional[str] = None
+    plan: str = "zed_pro"
+    billing_url: Optional[str] = None
+    session_cookie: Optional[str] = None
+    spend_limit: float = 10.00
+    spend_used: float = 0.00
+    balance_remaining: float = 10.00
+    tokens_used: int = 0
+    model_requests_used: int = 0
+    model_requests_limit: Optional[int] = None
+    last_billing_sync: Optional[float] = None
     current_llm_token: Optional[str] = None
     expires_at: Optional[int] = None
     status: str = "active"  # active, cooldown, unauthorized, disabled
@@ -27,6 +45,13 @@ class Account(BaseModel):
     failed_requests: int = 0
     last_error: Optional[str] = None
     last_used: Optional[float] = None
+
+    def record_usage(self, input_tokens: int, output_tokens: int, model: str = "") -> float:
+        cost = calculate_cost(model, input_tokens, output_tokens)
+        self.tokens_used += (input_tokens + output_tokens)
+        self.spend_used += cost
+        self.balance_remaining = max(0.0, round(self.spend_limit - self.spend_used, 4))
+        return cost
 
     def is_available(self) -> bool:
         if self.status in ("unauthorized", "disabled"):
@@ -83,6 +108,15 @@ class AccountPool:
             tot_req = 0
             succ_req = 0
             fail_req = 0
+            tokens_used = int(item.get("tokens_used", 0))
+            spend_used = float(item.get("spend_used", 0.00))
+            plan = item.get("plan", "zed_vip" if item.get("organization_id") == "org_01m24akygwy207azwerfw280fe" else "zed_pro")
+            spend_limit = float(item.get("spend_limit", PLAN_DEFAULT_LIMITS.get(plan, 10.00)))
+            balance_rem = float(item.get("balance_remaining", max(0.0, spend_limit - spend_used)))
+            org_id = item.get("organization_id")
+            org_name = item.get("org_name")
+            session_cookie = item.get("session_cookie") or item.get("cookie")
+            billing_url = item.get("billing_url") or build_billing_url(org_id)
 
             if prev and prev.access_token == tok_str:
                 cur_token = cur_token or prev.current_llm_token
@@ -90,13 +124,27 @@ class AccountPool:
                 tot_req = prev.total_requests
                 succ_req = prev.successful_requests
                 fail_req = prev.failed_requests
+                tokens_used = prev.tokens_used
+                spend_used = prev.spend_used
+                spend_limit = prev.spend_limit
+                balance_rem = prev.balance_remaining
+                org_name = org_name or prev.org_name
+                billing_url = billing_url or prev.billing_url
 
             account = Account(
                 id=acc_id,
                 name=item.get("name", f"Account-{acc_id}"),
                 user_id=user_id,
                 access_token=tok_str,
-                organization_id=item.get("organization_id"),
+                organization_id=org_id,
+                org_name=org_name,
+                plan=plan,
+                billing_url=billing_url,
+                session_cookie=session_cookie,
+                spend_limit=spend_limit,
+                spend_used=spend_used,
+                balance_remaining=balance_rem,
+                tokens_used=tokens_used,
                 current_llm_token=cur_token,
                 expires_at=exp_at,
                 status=item.get("status", "active"),
@@ -106,6 +154,38 @@ class AccountPool:
             )
             new_accounts.append(account)
         self.accounts = new_accounts
+
+    def _enrich_account_billing_sync(self, account: Account) -> None:
+        try:
+            details = fetch_zed_account_details(account.user_id, account.access_token, settings.zed_api_url)
+            if details:
+                if not account.organization_id and details.get("organization_id"):
+                    account.organization_id = details["organization_id"]
+                if not account.org_name and details.get("org_name"):
+                    account.org_name = details["org_name"]
+                if details.get("plan"):
+                    account.plan = details["plan"]
+                    if account.spend_limit == 10.0 and details["plan"] == "zed_vip":
+                        account.spend_limit = 100.00
+                        account.balance_remaining = max(0.0, account.spend_limit - account.spend_used)
+                account.billing_url = build_billing_url(account.organization_id)
+                if details.get("model_requests_used") is not None:
+                    account.model_requests_used = details["model_requests_used"]
+                if details.get("model_requests_limit") is not None:
+                    account.model_requests_limit = details["model_requests_limit"]
+
+            if account.session_cookie and account.organization_id:
+                live = fetch_live_orb_billing(account.organization_id, account.session_cookie, settings.zed_api_url)
+                if live:
+                    if live.get("spend_used") is not None:
+                        account.spend_used = live["spend_used"]
+                    if live.get("spend_limit") is not None:
+                        account.spend_limit = live["spend_limit"]
+                    if live.get("balance_remaining") is not None:
+                        account.balance_remaining = live["balance_remaining"]
+                    account.last_billing_sync = time.time()
+        except Exception as e:
+            logger.debug(f"Enrich account billing failed for {account.id}: {e}")
 
     async def _ensure_token_refreshed(self, account: Account) -> bool:
         """Deduplicated token refresh per account outside of the global pool lock."""
@@ -121,6 +201,10 @@ class AccountPool:
 
         async def _do_refresh():
             try:
+                # Auto-enrich account metadata and live billing if needed
+                if not account.organization_id or not account.org_name or account.session_cookie:
+                    self._enrich_account_billing_sync(account)
+
                 res = await self.refresher.fetch_llm_token(
                     account.user_id, account.access_token, account.organization_id
                 )
@@ -258,6 +342,16 @@ class AccountPool:
                     "failed_requests": a.failed_requests,
                     "last_error": a.last_error,
                     "last_used": a.last_used,
+                    "organization_id": a.organization_id,
+                    "org_name": a.org_name,
+                    "plan": a.plan,
+                    "billing_url": a.billing_url,
+                    "spend_limit": round(a.spend_limit, 2),
+                    "spend_used": round(a.spend_used, 4),
+                    "balance_remaining": round(a.balance_remaining, 2),
+                    "tokens_used": a.tokens_used,
+                    "model_requests_used": a.model_requests_used,
+                    "model_requests_limit": a.model_requests_limit,
                 }
             )
 
@@ -268,5 +362,21 @@ class AccountPool:
             "available_accounts": available_count,
             "active_accounts": available_count,
             "cooldown_accounts": cooldown_count,
+            "total_balance_remaining": round(self.get_total_balance_remaining(), 2),
+            "total_spend_limit": round(self.get_total_spend_limit(), 2),
+            "total_spend_used": round(self.get_total_spend_used(), 4),
+            "total_tokens_used": self.get_total_tokens_used(),
             "accounts": accounts_info,
         }
+
+    def get_total_balance_remaining(self) -> float:
+        return sum(a.balance_remaining for a in self.accounts if a.is_available())
+
+    def get_total_spend_limit(self) -> float:
+        return sum(a.spend_limit for a in self.accounts if a.is_available())
+
+    def get_total_spend_used(self) -> float:
+        return sum(a.spend_used for a in self.accounts)
+
+    def get_total_tokens_used(self) -> int:
+        return sum(a.tokens_used for a in self.accounts)

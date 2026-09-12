@@ -39,23 +39,32 @@ def normalize_content_text(content: Any) -> str:
 
 
 def convert_tools_openai_to_anthropic(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Converts OpenAI tools list into Anthropic format."""
+    """Converts OpenAI/Codex tools list into Anthropic format with guaranteed input_schema."""
     anthropic_tools = []
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         if tool.get("type") == "function" and "function" in tool:
             func = tool["function"]
+            schema = func.get("parameters") or {"type": "object", "properties": {}}
             anthropic_tools.append(
                 {
                     "name": func.get("name", ""),
                     "description": func.get("description", ""),
-                    "input_schema": func.get("parameters", {}),
+                    "input_schema": schema,
                 }
             )
         else:
-            # Already Anthropic or generic format
-            anthropic_tools.append(tool)
+            name = tool.get("name", "")
+            desc = tool.get("description", "")
+            schema = tool.get("input_schema") or tool.get("parameters") or {"type": "object", "properties": {}}
+            anthropic_tools.append(
+                {
+                    "name": name,
+                    "description": desc,
+                    "input_schema": schema,
+                }
+            )
     return anthropic_tools
 
 
@@ -131,17 +140,17 @@ def convert_messages_for_anthropic(messages: List[Dict[str, Any]]) -> Tuple[Opti
                 continue
 
             # Standard turn
+            new_text = normalize_content_text(raw_content)
             if processed_turns and processed_turns[-1]["role"] == role:
                 # Merge consecutive same-role turns for Anthropic compliance
                 prev = processed_turns[-1]
                 prev_c = prev["content"]
-                new_text = normalize_content_text(raw_content)
-                if isinstance(prev_c, str):
-                    prev["content"] = prev_c + "\n\n" + new_text
-                elif isinstance(prev_c, list):
+                if isinstance(prev_c, list):
                     prev_c.append({"type": "text", "text": new_text})
+                else:
+                    prev["content"] = [{"type": "text", "text": str(prev_c) + "\n\n" + new_text}]
             else:
-                processed_turns.append({"role": role, "content": raw_content or ""})
+                processed_turns.append({"role": role, "content": [{"type": "text", "text": new_text}]})
 
     system_prompt = "\n\n".join(system_parts) if system_parts else None
     return system_prompt, processed_turns

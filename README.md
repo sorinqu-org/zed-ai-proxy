@@ -274,10 +274,49 @@ codex -c model_provider=zed -c model=gpt-5.6-luna
 
 ---
 
+## Balance & Quota Tracking
+
+`zed-ai-proxy` provides real-time token tracking, budget monitoring, and balance aggregation across all configured accounts.
+
+- Inspect balance in terminal via CLI:
+  ```bash
+  zed-proxy status
+  ```
+  Outputs total remaining balance, total tokens consumed, estimated cost, and direct links to each account's Zed billing usage page (`https://dashboard.zed.dev/{org_id}/billing/usage`).
+- Inspect web dashboard at `http://localhost:8080/dashboard`.
+- Programmatic JSON telemetry via `GET /status`.
+
+---
+
+## Model Isolation & Commercial Hosting Security
+
+If hosting `zed-ai-proxy` on a remote server to sell or distribute API access:
+
+1. **How Tool Execution Works:**
+   Language models do not execute code directly on the proxy host; tool calls (`tool_use` or `tool_calls`) are returned as JSON blocks to the requesting client (e.g. Cursor, Claude Code, Codex), which normally executes them locally. However, when exposing an API to untrusted users, prompt injection and malicious tool schemas pose risks.
+2. **Tool Use Isolation Policy (`TOOL_POLICY`):**
+   - `sanitize` (default): Automatically detects and blocks dangerous system-level tool definitions (e.g., `bash`, `exec`, `terminal`, `write_file`, `subprocess`).
+   - `block_all`: Completely strips `tools` and `tool_choice` from requests, enforcing pure conversational inference.
+   - `allow`: Allows all client-defined tools.
+3. **Prompt Sandbox Inoculation (`STRICT_ISOLATION=true`):**
+   Injects immutable sandboxing constraints into the system prompt instructing the model to decline host-level command execution, reconnaissance, or data exfiltration.
+4. **Client API Key Authentication (`PROXY_API_KEYS`):**
+   Comma-separated list of Bearer tokens required for `/v1/*` endpoints to prevent unauthorized usage and budget draining.
+   ```bash
+   export PROXY_API_KEYS="sk-client-1,sk-client-2"
+   ```
+5. **Admin Endpoint Protection (`ADMIN_KEY`):**
+   Protects `/dashboard`, `/status`, and `/api/refresh` so public users cannot inspect account user IDs, balances, or trigger manual refreshes:
+   ```bash
+   export ADMIN_KEY="secret-admin-pass"
+   ```
+
+---
+
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+PYTHONPATH=. pytest tests/ -v
 ```
 
 ---

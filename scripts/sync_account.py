@@ -287,6 +287,20 @@ def upsert_account(
             matched_idx = i
             break
 
+    # Auto-detect best org and plan
+    meta: Dict[str, Any] = {}
+    try:
+        from app.core.billing import fetch_zed_account_details, build_billing_url, PLAN_DEFAULT_LIMITS
+        meta = fetch_zed_account_details(str(user_id), access_token, ZED_CLOUD_URL)
+    except Exception:
+        meta = {}
+
+    detected_org = organization_id or meta.get("organization_id")
+    detected_org_name = meta.get("org_name")
+    detected_plan = meta.get("plan", "zed_pro")
+    billing_url = meta.get("billing_url") or (f"https://dashboard.zed.dev/{detected_org}/billing/usage" if detected_org else "https://dashboard.zed.dev/billing/usage")
+    default_spend_limit = 100.00 if detected_plan == "zed_vip" else 10.00
+
     if matched_idx >= 0:
         # Update existing
         target = accounts[matched_idx]
@@ -295,8 +309,17 @@ def upsert_account(
         target["last_error"] = None
         if account_name:
             target["name"] = account_name
-        if organization_id is not None:
-            target["organization_id"] = organization_id
+        if detected_org is not None:
+            target["organization_id"] = detected_org
+        if detected_org_name:
+            target["org_name"] = detected_org_name
+        if detected_plan:
+            target["plan"] = detected_plan
+        target["billing_url"] = billing_url
+        if "spend_limit" not in target:
+            target["spend_limit"] = default_spend_limit
+        if "balance_remaining" not in target:
+            target["balance_remaining"] = max(0.0, target["spend_limit"] - float(target.get("spend_used", 0.0)))
         action = "updated"
         result_account = target
     else:
@@ -313,7 +336,14 @@ def upsert_account(
             "name": account_name or f"Zed Account {user_id}",
             "user_id": str(user_id),
             "access_token": access_token,
-            "organization_id": organization_id,
+            "organization_id": detected_org,
+            "org_name": detected_org_name,
+            "plan": detected_plan,
+            "billing_url": billing_url,
+            "spend_limit": default_spend_limit,
+            "spend_used": 0.0,
+            "balance_remaining": default_spend_limit,
+            "tokens_used": 0,
             "status": "active",
         }
         accounts.append(new_account)

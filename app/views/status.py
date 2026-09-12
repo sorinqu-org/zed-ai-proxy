@@ -3,12 +3,15 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, Any
 from app.config import settings
+from app.core.security import security_policy
+from app.core.billing import format_currency, format_tokens
 
 router = APIRouter()
 
 
 @router.get("/status", response_class=JSONResponse)
 async def get_status(request: Request) -> Dict[str, Any]:
+    security_policy.verify_admin_auth(request)
     pool = request.app.state.pool
     summary = pool.get_status_summary()
     return summary
@@ -16,6 +19,7 @@ async def get_status(request: Request) -> Dict[str, Any]:
 
 @router.post("/api/refresh", response_class=JSONResponse)
 async def trigger_refresh(request: Request) -> Dict[str, Any]:
+    security_policy.verify_admin_auth(request)
     pool = request.app.state.pool
     pool.load_from_file(settings.accounts_file)
     await pool.refresh_all_tokens()
@@ -25,6 +29,7 @@ async def trigger_refresh(request: Request) -> Dict[str, Any]:
 @router.get("/", response_class=HTMLResponse)
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request) -> str:
+    security_policy.verify_admin_auth(request)
     pool = request.app.state.pool
     summary = pool.get_status_summary()
 
@@ -38,19 +43,28 @@ async def dashboard(request: Request) -> str:
         safe_name = html.escape(str(a["name"]))
         safe_uid = html.escape(str(a["user_id"]))
         safe_status = html.escape(str(a["status"]))
+        safe_plan = html.escape(str(a.get("plan") or "zed_pro"))
+        safe_org = html.escape(str(a.get("org_name") or ""))
+        plan_display = f"{safe_plan} ({safe_org})" if safe_org else safe_plan
         exp_str = f"{a['token_expires_in_seconds']}s" if a["token_expires_in_seconds"] else "None"
-        cd_str = f"{a['cooldown_remaining_seconds']}s" if a["cooldown_remaining_seconds"] else "-"
         last_err = html.escape(str(a["last_error"])) if a["last_error"] else "-"
+
+        bal_rem = a.get("balance_remaining", 0.0)
+        spend_lim = a.get("spend_limit", 10.0)
+        toks = format_tokens(a.get("tokens_used", 0))
+        billing_url = a.get("billing_url") or "https://dashboard.zed.dev/billing/usage"
+        safe_burl = html.escape(billing_url)
 
         rows_html += f"""
         <tr>
-            <td>{safe_id}</td>
+            <td><strong>{safe_id}</strong></td>
             <td>{safe_name}</td>
-            <td>{safe_uid}</td>
+            <td><span class="badge" style="background:#334155;">{plan_display}</span></td>
+            <td><strong style="color:#10b981;">${bal_rem:.2f}</strong> <span style="color:#94a3b8; font-size:12px;">/ ${spend_lim:.2f}</span></td>
+            <td>{toks}</td>
+            <td><a href="{safe_burl}" target="_blank" style="color:#38bdf8; text-decoration:none; font-size:12px;">View Usage &rarr;</a></td>
             <td><span class="badge" style="background:{status_color};">{safe_status}</span></td>
-            <td>{'Yes' if a['has_token'] else 'No'}</td>
             <td>{exp_str}</td>
-            <td>{cd_str}</td>
             <td>{a['successful_requests']} / {a['total_requests']}</td>
             <td style="color:#ef4444; font-size:12px;">{last_err}</td>
         </tr>
@@ -156,16 +170,24 @@ async def dashboard(request: Request) -> str:
 
         <div class="cards">
             <div class="card">
-                <div class="card-label">Total Accounts</div>
-                <div class="card-val">{summary['total_accounts']}</div>
+                <div class="card-label">Total Remaining Balance</div>
+                <div class="card-val" style="color: #10b981;">${summary.get('total_balance_remaining', 0.0):.2f}</div>
+                <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">of ${summary.get('total_spend_limit', 0.0):.2f} limit</div>
             </div>
             <div class="card">
-                <div class="card-label">Available Accounts</div>
-                <div class="card-val" style="color: #10b981;">{summary['available_accounts']}</div>
+                <div class="card-label">Total Tokens Used</div>
+                <div class="card-val">{format_tokens(summary.get('total_tokens_used', 0))}</div>
+                <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">spent: ${summary.get('total_spend_used', 0.0):.4f}</div>
             </div>
             <div class="card">
-                <div class="card-label">Auto-Refresh Interval</div>
-                <div class="card-val">60s</div>
+                <div class="card-label">Active / Total Accounts</div>
+                <div class="card-val">{summary['available_accounts']} / {summary['total_accounts']}</div>
+                <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">in cooldown: {summary.get('cooldown_accounts', 0)}</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Isolation & Policy</div>
+                <div class="card-val" style="font-size: 20px; color: #38bdf8; margin-top: 4px;">Sandboxed</div>
+                <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">tools: {settings.tool_policy}</div>
             </div>
         </div>
 
@@ -174,17 +196,18 @@ async def dashboard(request: Request) -> str:
                 <tr>
                     <th>ID</th>
                     <th>Name</th>
-                    <th>User ID</th>
+                    <th>Plan / Org</th>
+                    <th>Balance</th>
+                    <th>Tokens</th>
+                    <th>Zed Dashboard</th>
                     <th>Status</th>
-                    <th>Has Token</th>
                     <th>Token Exp</th>
-                    <th>Cooldown</th>
                     <th>Success / Total</th>
                     <th>Last Error</th>
                 </tr>
             </thead>
             <tbody>
-                {rows_html if rows_html else '<tr><td colspan="9" style="text-align:center; color:#94a3b8;">No accounts configured. Check accounts.json</td></tr>'}
+                {rows_html if rows_html else '<tr><td colspan="10" style="text-align:center; color:#94a3b8;">No accounts configured. Check accounts.json</td></tr>'}
             </tbody>
         </table>
     </div>

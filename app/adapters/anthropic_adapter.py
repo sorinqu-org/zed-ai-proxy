@@ -29,8 +29,58 @@ def anthropic_to_zed_body(req: Dict[str, Any]) -> Dict[str, Any]:
     provider = detect_provider(model)
     provider_req = dict(req)
     provider_req["model"] = model
-    if "messages" in provider_req:
-        provider_req["messages"] = filter_payload(provider_req["messages"])
+
+    # Extract any system messages out of messages array into provider_req["system"]
+    system_parts = []
+    if "system" in provider_req and provider_req["system"]:
+        sys = provider_req["system"]
+        if isinstance(sys, str):
+            system_parts.append(sys)
+        elif isinstance(sys, list):
+            for b in sys:
+                if isinstance(b, dict) and "text" in b:
+                    system_parts.append(b["text"])
+                elif isinstance(b, str):
+                    system_parts.append(b)
+
+    filtered_msgs = []
+    raw_msgs = provider_req.get("messages") or []
+    for m in raw_msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role in ("system", "developer"):
+            c = m.get("content", "")
+            if isinstance(c, str):
+                system_parts.append(c)
+            elif isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and "text" in b:
+                        system_parts.append(b["text"])
+                    elif isinstance(b, str):
+                        system_parts.append(b)
+        else:
+            filtered_msgs.append(m)
+
+    if system_parts:
+        provider_req["system"] = "\n\n".join(system_parts)
+
+    if "max_tokens" not in provider_req or not provider_req["max_tokens"]:
+        provider_req["max_tokens"] = 4096
+
+    if "betas" in provider_req and isinstance(provider_req["betas"], list):
+        allowed_betas = {"compact_20260112"}
+        filtered_betas = [b for b in provider_req["betas"] if b in allowed_betas]
+        if filtered_betas:
+            provider_req["betas"] = filtered_betas
+        else:
+            del provider_req["betas"]
+
+    # Claude Code sends context_management: {edits: [{type: "clear_thinking_20251015"}]} which Zed Cloud rejects
+    if "context_management" in provider_req:
+        del provider_req["context_management"]
+
+    provider_req["messages"] = filter_payload(filtered_msgs)
     provider_req["stream"] = True
 
     return {

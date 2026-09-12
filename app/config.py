@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional, List
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -29,5 +30,14 @@ class Settings(BaseModel):
     token_refresh_threshold_seconds: int = 300
     rate_limit_cooldown_seconds: int = 60
     max_image_size_bytes: int = 500_000
+    tool_policy: str = Field(default_factory=lambda: os.getenv("TOOL_POLICY", "sanitize"))  # allow, sanitize, block_all
+    api_keys: list[str] = Field(
+        default_factory=lambda: [k.strip() for k in os.getenv("PROXY_API_KEYS", "").split(",") if k.strip()]
+    )
+    admin_key: Optional[str] = Field(default_factory=lambda: os.getenv("ADMIN_KEY") or None)
+    strict_isolation: bool = Field(
+        default_factory=lambda: os.getenv("STRICT_ISOLATION", "true").lower() in ("true", "1", "yes")
+    )
+
 
 settings = Settings()

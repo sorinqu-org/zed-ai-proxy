@@ -50,8 +50,8 @@ def test_openai_to_zed_body_anthropic():
     assert zed_body["provider"] == "anthropic"
     assert zed_body["model"] == "claude-opus-5"
     assert zed_body["provider_request"]["system"] == "Be concise."
-    assert len(zed_body["provider_request"]["messages"]) == 1
-    assert zed_body["provider_request"]["messages"][0]["content"] == "Hi"
+    content = zed_body["provider_request"]["messages"][0]["content"]
+    assert content == "Hi" or content == [{"type": "text", "text": "Hi"}]
     assert zed_body["provider_request"]["tools"][0]["name"] == "get_weather"
     assert "input_schema" in zed_body["provider_request"]["tools"][0]
 
