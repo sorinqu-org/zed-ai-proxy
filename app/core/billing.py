@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import urllib.request
 import urllib.error
 from typing import Optional, Dict, Any, Tuple
@@ -176,3 +177,87 @@ def fetch_live_orb_billing(
     except Exception as e:
         logger.debug(f"Live Orb billing query failed for org {org_id}: {e}")
         return None
+
+
+def fetch_orb_portal_billing(portal_url_or_token: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetches live token credits balance from WithOrb billing portal (https://portal.withorb.com).
+    Zed Cloud delegates token credit ledger to WithOrb.
+
+    Accepts either full portal URL:
+        https://portal.withorb.com/view?token=...
+    Or raw token string:
+        ImdidERNUWRoUFoyVTc2SkQi.79VapjMJTXCnR2dfDKqoyp5QRlc
+    """
+    if not portal_url_or_token:
+        return None
+
+    match = re.search(r"token=([A-Za-z0-9_\-\.]+)", portal_url_or_token)
+    token = match.group(1) if match else portal_url_or_token.strip()
+    if not token:
+        return None
+
+    headers = {
+        "Referer": f"https://portal.withorb.com/view?token={token}",
+        "Origin": "https://portal.withorb.com",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+
+    try:
+        # Step 1: Query customer metadata and active ledger currency
+        url1 = f"https://portal.withorb.com/api/v1/customer_from_link?token={token}"
+        req1 = urllib.request.Request(url1, headers=headers)
+        with urllib.request.urlopen(req1, timeout=15.0) as resp1:
+            data1 = json.loads(resp1.read().decode("utf-8"))
+
+        customer = data1.get("customer") or {}
+        customer_id = customer.get("id")
+        customer_name = customer.get("name", "")
+        currencies = data1.get("account", {}).get("currencies", [])
+        pricing_unit_id = currencies[0].get("id") if currencies else (customer.get("pricing_unit") or {}).get("id")
+
+        if not customer_id:
+            logger.warning("Orb portal customer_from_link returned no customer ID")
+            return None
+
+        # Step 2: Query ledger summary
+        puid_param = f"&pricing_unit_id={pricing_unit_id}" if pricing_unit_id else ""
+        url2 = f"https://portal.withorb.com/api/v1/customers/{customer_id}/ledger_summary?token={token}{puid_param}"
+        req2 = urllib.request.Request(url2, headers=headers)
+        with urllib.request.urlopen(req2, timeout=15.0) as resp2:
+            data2 = json.loads(resp2.read().decode("utf-8"))
+
+        credits_bal_str = data2.get("credits_balance")
+        credit_blocks = data2.get("credit_blocks") or []
+
+        # Find maximum initial balance across credit blocks
+        max_init_bal = 0.0
+        for block in credit_blocks:
+            init_str = block.get("maximum_initial_balance")
+            if init_str:
+                try:
+                    max_init_bal = max(max_init_bal, float(init_str))
+                except (ValueError, TypeError):
+                    pass
+
+        credits_bal = float(credits_bal_str) if credits_bal_str is not None else 0.0
+        if max_init_bal == 0.0:
+            max_init_bal = credits_bal
+
+        spend_used = max(0.0, max_init_bal - credits_bal)
+
+        return {
+            "balance_remaining": round(credits_bal, 2),
+            "spend_limit": round(max_init_bal, 2),
+            "spend_used": round(spend_used, 2),
+            "customer_id": customer_id,
+            "customer_name": customer_name,
+            "pricing_unit_id": pricing_unit_id,
+            "portal_token": token,
+            "portal_url": f"https://portal.withorb.com/view?token={token}",
+        }
+    except Exception as e:
+        logger.warning(f"Failed to query Orb portal billing: {e}")
+        return None
+

@@ -208,13 +208,16 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(f"{aid:<8} {name:<18} {plan_org:<20} {bal_str:<18} {toks:<10} {stat:<9} {exp:<9} {reqs}")
 
         b_url = a.get("billing_url")
+        orb_url = a.get("orb_portal_url")
         if b_url:
-            billing_links.append((aid, b_url))
+            billing_links.append((aid, "Zed Usage", b_url))
+        if orb_url:
+            billing_links.append((aid, "Orb Portal", orb_url))
 
     if billing_links:
-        print("\nZed Dashboard Billing & Usage URLs:")
-        for aid, burl in billing_links:
-            print(f"  [{aid}] {burl}")
+        print("\nBilling & Usage Portals:")
+        for aid, label, burl in billing_links:
+            print(f"  [{aid}] ({label}) {burl}")
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
@@ -232,6 +235,10 @@ def cmd_sync(args: argparse.Namespace) -> None:
         sync_args.extend(["--user-id", args.user_id])
     if args.access_token:
         sync_args.extend(["--access-token", args.access_token])
+    if getattr(args, "orb_portal", None):
+        sync_args.extend(["--orb-portal", args.orb_portal])
+    if getattr(args, "orb_token", None):
+        sync_args.extend(["--orb-token", args.orb_token])
 
     # Forward proxy url
     host = args.host or settings.host
@@ -393,6 +400,8 @@ def main() -> None:
     p_sync.add_argument("--dry-run", action="store_true", help="Extract without saving")
     p_sync.add_argument("--user-id", type=str, default=None)
     p_sync.add_argument("--access-token", type=str, default=None)
+    p_sync.add_argument("--orb-portal", type=str, default=None, help="WithOrb billing portal URL or token")
+    p_sync.add_argument("--orb-token", type=str, default=None, help="WithOrb billing portal token directly")
     p_sync.add_argument("--host", type=str, default="localhost")
     p_sync.add_argument("--port", type=int, default=None)
 

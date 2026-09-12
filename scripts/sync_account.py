@@ -268,6 +268,8 @@ def upsert_account(
     access_token: str,
     account_name: Optional[str] = None,
     organization_id: Optional[str] = None,
+    orb_portal_url: Optional[str] = None,
+    orb_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Inserts or updates an account in accounts.json atomically."""
     accounts: List[Dict[str, Any]] = []
@@ -301,6 +303,20 @@ def upsert_account(
     billing_url = meta.get("billing_url") or (f"https://dashboard.zed.dev/{detected_org}/billing/usage" if detected_org else "https://dashboard.zed.dev/billing/usage")
     default_spend_limit = 100.00 if detected_plan == "zed_vip" else 10.00
 
+    active_orb = orb_portal_url or orb_token
+    if not active_orb and matched_idx >= 0:
+        active_orb = accounts[matched_idx].get("orb_portal_url") or accounts[matched_idx].get("orb_token")
+
+    orb_meta = None
+    if active_orb:
+        try:
+            from app.core.billing import fetch_orb_portal_billing
+            orb_meta = fetch_orb_portal_billing(active_orb)
+            if orb_meta:
+                print(f"[+] Synced WithOrb ledger: ${orb_meta['balance_remaining']:.2f} / ${orb_meta['spend_limit']:.2f} remaining")
+        except Exception as e:
+            print(f"[!] Warning: Failed to query WithOrb portal: {e}")
+
     if matched_idx >= 0:
         # Update existing
         target = accounts[matched_idx]
@@ -316,10 +332,18 @@ def upsert_account(
         if detected_plan:
             target["plan"] = detected_plan
         target["billing_url"] = billing_url
-        if "spend_limit" not in target:
-            target["spend_limit"] = default_spend_limit
-        if "balance_remaining" not in target:
-            target["balance_remaining"] = max(0.0, target["spend_limit"] - float(target.get("spend_used", 0.0)))
+        if orb_meta:
+            target["orb_portal_url"] = orb_meta.get("portal_url") or active_orb
+            target["balance_remaining"] = orb_meta["balance_remaining"]
+            target["spend_limit"] = orb_meta["spend_limit"]
+            target["spend_used"] = orb_meta["spend_used"]
+            if orb_meta.get("customer_name") and not target.get("org_name"):
+                target["org_name"] = orb_meta["customer_name"]
+        else:
+            if "spend_limit" not in target:
+                target["spend_limit"] = default_spend_limit
+            if "balance_remaining" not in target:
+                target["balance_remaining"] = max(0.0, target["spend_limit"] - float(target.get("spend_used", 0.0)))
         action = "updated"
         result_account = target
     else:
@@ -337,12 +361,13 @@ def upsert_account(
             "user_id": str(user_id),
             "access_token": access_token,
             "organization_id": detected_org,
-            "org_name": detected_org_name,
+            "org_name": (orb_meta.get("customer_name") if orb_meta and orb_meta.get("customer_name") else detected_org_name),
             "plan": detected_plan,
             "billing_url": billing_url,
-            "spend_limit": default_spend_limit,
-            "spend_used": 0.0,
-            "balance_remaining": default_spend_limit,
+            "orb_portal_url": (orb_meta.get("portal_url") or active_orb) if orb_meta else None,
+            "spend_limit": orb_meta["spend_limit"] if orb_meta else default_spend_limit,
+            "spend_used": orb_meta["spend_used"] if orb_meta else 0.0,
+            "balance_remaining": orb_meta["balance_remaining"] if orb_meta else default_spend_limit,
             "tokens_used": 0,
             "status": "active",
         }
@@ -404,6 +429,18 @@ def main() -> None:
         default=None,
         help="Manually specify access_token (skips OS keychain search)",
     )
+    parser.add_argument(
+        "--orb-portal",
+        type=str,
+        default=None,
+        help="WithOrb billing portal URL or token (e.g. https://portal.withorb.com/view?token=...)",
+    )
+    parser.add_argument(
+        "--orb-token",
+        type=str,
+        default=None,
+        help="WithOrb billing portal token directly",
+    )
 
     args = parser.parse_args()
 
@@ -464,7 +501,14 @@ def main() -> None:
         return
 
     # Upsert
-    res = upsert_account(accounts_file, user_id, access_token, account_name=args.name)
+    res = upsert_account(
+        accounts_file,
+        user_id,
+        access_token,
+        account_name=args.name,
+        orb_portal_url=args.orb_portal,
+        orb_token=args.orb_token,
+    )
     act = res["action"]
     acc = res["account"]
     tot = res["total_accounts"]

@@ -13,6 +13,7 @@ from app.core.billing import (
     calculate_cost,
     fetch_zed_account_details,
     fetch_live_orb_billing,
+    fetch_orb_portal_billing,
     PLAN_DEFAULT_LIMITS,
 )
 
@@ -28,6 +29,8 @@ class Account(BaseModel):
     org_name: Optional[str] = None
     plan: str = "zed_pro"
     billing_url: Optional[str] = None
+    orb_portal_url: Optional[str] = None
+    orb_token: Optional[str] = None
     session_cookie: Optional[str] = None
     spend_limit: float = 10.00
     spend_used: float = 0.00
@@ -117,6 +120,8 @@ class AccountPool:
             org_name = item.get("org_name")
             session_cookie = item.get("session_cookie") or item.get("cookie")
             billing_url = item.get("billing_url") or build_billing_url(org_id)
+            orb_portal_url = item.get("orb_portal_url")
+            orb_token = item.get("orb_token")
 
             if prev and prev.access_token == tok_str:
                 cur_token = cur_token or prev.current_llm_token
@@ -130,6 +135,8 @@ class AccountPool:
                 balance_rem = prev.balance_remaining
                 org_name = org_name or prev.org_name
                 billing_url = billing_url or prev.billing_url
+                orb_portal_url = orb_portal_url or getattr(prev, "orb_portal_url", None)
+                orb_token = orb_token or getattr(prev, "orb_token", None)
 
             account = Account(
                 id=acc_id,
@@ -140,6 +147,8 @@ class AccountPool:
                 org_name=org_name,
                 plan=plan,
                 billing_url=billing_url,
+                orb_portal_url=orb_portal_url,
+                orb_token=orb_token,
                 session_cookie=session_cookie,
                 spend_limit=spend_limit,
                 spend_used=spend_used,
@@ -183,6 +192,19 @@ class AccountPool:
                         account.spend_limit = live["spend_limit"]
                     if live.get("balance_remaining") is not None:
                         account.balance_remaining = live["balance_remaining"]
+                    account.last_billing_sync = time.time()
+
+            if account.orb_portal_url or account.orb_token:
+                orb_info = fetch_orb_portal_billing(account.orb_portal_url or account.orb_token)
+                if orb_info:
+                    if orb_info.get("balance_remaining") is not None:
+                        account.balance_remaining = orb_info["balance_remaining"]
+                    if orb_info.get("spend_limit") is not None:
+                        account.spend_limit = orb_info["spend_limit"]
+                    if orb_info.get("spend_used") is not None:
+                        account.spend_used = orb_info["spend_used"]
+                    if orb_info.get("customer_name") and not account.org_name:
+                        account.org_name = orb_info["customer_name"]
                     account.last_billing_sync = time.time()
         except Exception as e:
             logger.debug(f"Enrich account billing failed for {account.id}: {e}")
@@ -346,6 +368,7 @@ class AccountPool:
                     "org_name": a.org_name,
                     "plan": a.plan,
                     "billing_url": a.billing_url,
+                    "orb_portal_url": a.orb_portal_url,
                     "spend_limit": round(a.spend_limit, 2),
                     "spend_used": round(a.spend_used, 4),
                     "balance_remaining": round(a.balance_remaining, 2),

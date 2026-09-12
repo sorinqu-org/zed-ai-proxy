@@ -103,3 +103,53 @@ def test_pool_totals_and_summary():
     assert summary["total_tokens_used"] == 6200
     assert len(summary["accounts"]) == 2
     assert summary["accounts"][0]["billing_url"] == "https://dashboard.zed.dev/org_vip/billing/usage"
+
+
+def test_fetch_orb_portal_billing_mock(monkeypatch):
+    import json
+    import io
+    from app.core.billing import fetch_orb_portal_billing
+
+    class MockResponse:
+        def __init__(self, data):
+            self.data = json.dumps(data).encode("utf-8")
+        def read(self):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    def mock_urlopen(req, timeout=15.0):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "customer_from_link" in url:
+            return MockResponse({
+                "customer": {
+                    "id": "cust_123",
+                    "name": "Zed VIP Test",
+                    "pricing_unit": {"id": "unit_usd", "symbol": "$"}
+                },
+                "account": {
+                    "currencies": [{"id": "unit_usd", "symbol": "$"}]
+                }
+            })
+        elif "ledger_summary" in url:
+            return MockResponse({
+                "credits_balance": "15.64082815",
+                "credit_blocks": [
+                    {"maximum_initial_balance": "20.00", "balance": "15.64082815"}
+                ]
+            })
+        raise ValueError(f"Unexpected url: {url}")
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    res = fetch_orb_portal_billing("https://portal.withorb.com/view?token=test_token_123")
+    assert res is not None
+    assert res["balance_remaining"] == 15.64
+    assert res["spend_limit"] == 20.00
+    assert res["spend_used"] == 4.36
+    assert res["customer_name"] == "Zed VIP Test"
+    assert res["portal_token"] == "test_token_123"
+

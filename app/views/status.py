@@ -54,6 +54,11 @@ async def dashboard(request: Request) -> str:
         toks = format_tokens(a.get("tokens_used", 0))
         billing_url = a.get("billing_url") or "https://dashboard.zed.dev/billing/usage"
         safe_burl = html.escape(billing_url)
+        orb_url = a.get("orb_portal_url")
+        link_markup = f'<a href="{safe_burl}" target="_blank" style="color:#38bdf8; text-decoration:none; font-size:12px;">Zed Usage &rarr;</a>'
+        if orb_url:
+            safe_orb = html.escape(orb_url)
+            link_markup += f'<br><a href="{safe_orb}" target="_blank" style="color:#10b981; text-decoration:none; font-size:12px;">Orb Portal &rarr;</a>'
 
         rows_html += f"""
         <tr>
@@ -62,7 +67,7 @@ async def dashboard(request: Request) -> str:
             <td><span class="badge" style="background:#334155;">{plan_display}</span></td>
             <td><strong style="color:#10b981;">${bal_rem:.2f}</strong> <span style="color:#94a3b8; font-size:12px;">/ ${spend_lim:.2f}</span></td>
             <td>{toks}</td>
-            <td><a href="{safe_burl}" target="_blank" style="color:#38bdf8; text-decoration:none; font-size:12px;">View Usage &rarr;</a></td>
+            <td>{link_markup}</td>
             <td><span class="badge" style="background:{status_color};">{safe_status}</span></td>
             <td>{exp_str}</td>
             <td>{a['successful_requests']} / {a['total_requests']}</td>
