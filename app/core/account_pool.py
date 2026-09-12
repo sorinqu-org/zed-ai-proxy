@@ -270,6 +270,18 @@ class AccountPool:
                         account.spend_used = orb_info["spend_used"]
                     if orb_info.get("customer_name") and not account.org_name:
                         account.org_name = orb_info["customer_name"]
+                    if orb_info.get("model_stats"):
+                        account.model_stats = orb_info["model_stats"]
+                    if orb_info.get("total_tokens") is not None:
+                        account.tokens_used = orb_info["total_tokens"]
+                    if orb_info.get("input_tokens_total") is not None:
+                        account.input_tokens_total = orb_info["input_tokens_total"]
+                    if orb_info.get("output_tokens_total") is not None:
+                        account.output_tokens_total = orb_info["output_tokens_total"]
+                    if orb_info.get("cache_write_tokens_total") is not None:
+                        account.cache_write_tokens_total = orb_info["cache_write_tokens_total"]
+                    if orb_info.get("cache_read_tokens_total") is not None:
+                        account.cache_read_tokens_total = orb_info["cache_read_tokens_total"]
                     account.last_billing_sync = time.time()
         except Exception as e:
             logger.debug(f"Enrich account billing failed for {account.id}: {e}")

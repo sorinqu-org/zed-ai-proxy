@@ -1,9 +1,11 @@
 import json
 import logging
 import re
+import time
 import urllib.request
 import urllib.error
-from typing import Optional, Dict, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Dict, Any, Tuple, List
 
 logger = logging.getLogger("zed_proxy.billing")
 
@@ -188,7 +190,135 @@ def fetch_live_orb_billing(
         return None
 
 
-def fetch_orb_portal_billing(portal_url_or_token: str) -> Optional[Dict[str, Any]]:
+_ORB_USAGE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def fetch_orb_portal_token_usage(
+    token: str,
+    headers: Dict[str, str],
+    force_refresh: bool = False,
+    cache_ttl_seconds: float = 45.0,
+) -> Dict[str, Any]:
+    """
+    Fetches exact per-model token consumption directly from WithOrb subscription usage APIs.
+    Returns per-model breakdown (input, output, cache write, cache read, cost) and totals.
+    """
+    now = time.time()
+    if not force_refresh and token in _ORB_USAGE_CACHE:
+        cached_time, cached_val = _ORB_USAGE_CACHE[token]
+        if now - cached_time < cache_ttl_seconds:
+            return cached_val
+
+    url_sub = f"https://portal.withorb.com/api/v1/subscriptions_from_link?token={token}"
+    req_sub = urllib.request.Request(url_sub, headers=headers)
+    with urllib.request.urlopen(req_sub, timeout=15.0) as resp:
+        sub_data = json.loads(resp.read().decode("utf-8"))
+
+    subs = sub_data.get("data") or []
+    if not subs:
+        return {}
+
+    sub = subs[0]
+    sub_id = sub.get("id")
+    price_intervals = sub.get("price_intervals") or []
+
+    prices: List[Tuple[str, str, str, float]] = []
+    for pi in price_intervals:
+        p_info = pi.get("price", {})
+        pid = p_info.get("id")
+        p_details = p_info.get("price", {})
+        pname = p_details.get("name", "")
+        rate_str = p_details.get("unit_config", {}).get("unit_amount")
+        if pid and ":" in pname:
+            model_name, metric = [x.strip() for x in pname.split(":", 1)]
+            try:
+                rate = float(rate_str) if rate_str else 0.0
+            except (ValueError, TypeError):
+                rate = 0.0
+            prices.append((pid, model_name, metric, rate))
+
+    if not prices:
+        return {}
+
+    def _fetch_single_price_usage(item: Tuple[str, str, str, float]) -> Tuple[str, str, float, float]:
+        pid, model, metric, rate = item
+        u_url = f"https://portal.withorb.com/api/v1/subscriptions/{sub_id}/usage?price_id={pid}&token={token}"
+        r = urllib.request.Request(u_url, headers=headers)
+        try:
+            with urllib.request.urlopen(r, timeout=10.0) as resp_u:
+                d = json.loads(resp_u.read().decode("utf-8"))
+                raw_tot = d.get("current_total")
+                tot = float(raw_tot) if raw_tot is not None else 0.0
+                return (model, metric, rate, tot)
+        except Exception:
+            return (model, metric, rate, 0.0)
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        results = list(executor.map(_fetch_single_price_usage, prices))
+
+    model_stats: Dict[str, Dict[str, Any]] = {}
+    tot_in, tot_out, tot_cw, tot_cr = 0, 0, 0, 0
+    tot_cost = 0.0
+
+    for model, metric, rate, tot in results:
+        if model not in model_stats:
+            model_stats[model] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+                "requests_count": 0,
+                "cost_usd": 0.0,
+            }
+
+        m_data = model_stats[model]
+        cost = tot * rate
+        m_data["cost_usd"] += cost
+        tot_cost += cost
+
+        if "Write" in metric:
+            m_data["cache_write_tokens"] += int(tot)
+            tot_cw += int(tot)
+        elif "Read" in metric or "Cached" in metric:
+            m_data["cache_read_tokens"] += int(tot)
+            tot_cr += int(tot)
+        elif "Output" in metric:
+            m_data["output_tokens"] += int(tot)
+            tot_out += int(tot)
+        elif "Input" in metric:
+            m_data["input_tokens"] += int(tot)
+            tot_in += int(tot)
+
+        m_data["total_tokens"] = (
+            m_data["input_tokens"]
+            + m_data["output_tokens"]
+            + m_data["cache_write_tokens"]
+            + m_data["cache_read_tokens"]
+        )
+        m_data["cost_usd"] = round(m_data["cost_usd"], 4)
+
+    active_models = {k: v for k, v in model_stats.items() if v["total_tokens"] > 0}
+    total_tokens_all = tot_in + tot_out + tot_cw + tot_cr
+
+    res = {
+        "model_stats": active_models,
+        "input_tokens_total": tot_in,
+        "output_tokens_total": tot_out,
+        "cache_write_tokens_total": tot_cw,
+        "cache_read_tokens_total": tot_cr,
+        "total_tokens": total_tokens_all,
+        "estimated_cost_total": round(tot_cost, 4),
+    }
+    _ORB_USAGE_CACHE[token] = (now, res)
+    return res
+
+
+def fetch_orb_portal_billing(
+    portal_url_or_token: str,
+    fetch_model_usage: bool = True,
+    force_refresh: bool = False,
+) -> Optional[Dict[str, Any]]:
     """
     Fetches live token credits balance from WithOrb billing portal (https://portal.withorb.com).
     Zed Cloud delegates token credit ledger to WithOrb.
@@ -256,7 +386,15 @@ def fetch_orb_portal_billing(portal_url_or_token: str) -> Optional[Dict[str, Any
 
         spend_used = max(0.0, max_init_bal - credits_bal)
 
-        return {
+        # Step 3: Query per-model token analytics from WithOrb
+        token_usage: Dict[str, Any] = {}
+        if fetch_model_usage:
+            try:
+                token_usage = fetch_orb_portal_token_usage(token, headers, force_refresh=force_refresh)
+            except Exception as e:
+                logger.debug(f"Failed to query Orb token usage: {e}")
+
+        result: Dict[str, Any] = {
             "balance_remaining": round(credits_bal, 2),
             "spend_limit": round(max_init_bal, 2),
             "spend_used": round(spend_used, 2),
@@ -266,6 +404,10 @@ def fetch_orb_portal_billing(portal_url_or_token: str) -> Optional[Dict[str, Any
             "portal_token": token,
             "portal_url": f"https://portal.withorb.com/view?token={token}",
         }
+        if token_usage:
+            result.update(token_usage)
+
+        return result
     except Exception as e:
         logger.warning(f"Failed to query Orb portal billing: {e}")
         return None

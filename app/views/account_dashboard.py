@@ -44,13 +44,15 @@ def render_model_stats_table(model_stats: Dict[str, Dict[str, Any]]) -> str:
         </div>
         """
 
+        req_display = f"{reqs:,}" if reqs > 0 else "Metered"
+
         rows += f"""
         <tr>
             <td>
                 <div style="font-weight: 600; color: #f8fafc; font-family: ui-monospace, monospace;">{safe_model}</div>
                 {bar_html}
             </td>
-            <td style="font-family: ui-monospace, monospace;">{reqs:,}</td>
+            <td style="font-family: ui-monospace, monospace; color: {'#f8fafc' if reqs > 0 else '#94a3b8'};">{req_display}</td>
             <td style="font-family: ui-monospace, monospace; color: #38bdf8;">{in_tok:,}</td>
             <td style="font-family: ui-monospace, monospace; color: #818cf8;">{out_tok:,}</td>
             <td style="font-family: ui-monospace, monospace; color: #f59e0b;">{cw_tok:,}</td>
@@ -303,8 +305,9 @@ def render_account_detail_page(account: Account, all_accounts: List[Account]) ->
             </div>
         </div>
 
-        <div class="section-title">
-            Per-Model Token Analytics
+        <div class="section-title" style="display: flex; align-items: center; justify-content: space-between;">
+            <span>WithOrb Official Token Analytics</span>
+            <span class="badge" style="background: #065f46; color: #34d399; font-weight: 500; font-size: 11px;">WithOrb Metering Sync</span>
         </div>
         {model_table_html}
 

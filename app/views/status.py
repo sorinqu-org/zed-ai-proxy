@@ -1,4 +1,6 @@
+import asyncio
 import html
+import time
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, Any
@@ -235,6 +237,10 @@ async def account_dashboard(request: Request, account_id: str) -> str:
     account = pool.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail=f"Account '{account_id}' not found")
+    if (account.orb_portal_url or account.orb_token) and (
+        account.last_billing_sync is None or time.time() - account.last_billing_sync > 30
+    ):
+        await asyncio.to_thread(pool._enrich_account_billing_sync, account)
     return render_account_detail_page(account, pool.accounts)
 
 
@@ -245,6 +251,10 @@ async def account_stats(request: Request, account_id: str) -> Dict[str, Any]:
     account = pool.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail=f"Account '{account_id}' not found")
+    if (account.orb_portal_url or account.orb_token) and (
+        account.last_billing_sync is None or time.time() - account.last_billing_sync > 30
+    ):
+        await asyncio.to_thread(pool._enrich_account_billing_sync, account)
     return {
         "id": account.id,
         "name": account.name,
