@@ -266,10 +266,87 @@ curl -N http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer anything" \
   -d '{
-    "model": "claude-3-5-sonnet",
+    "model": "claude-sonnet-5",
     "messages": [{"role": "user", "content": "ping"}],
     "stream": true
   }'
+```
+
+---
+
+### Настройка Claude Code
+
+Для перенаправления Claude Code через `zed-ai-proxy`:
+
+1. Отредактируйте конфигурационный файл `~/.claude/settings.json`:
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8080",
+    "ANTHROPIC_AUTH_TOKEN": "zed-proxy-token",
+    "ANTHROPIC_MODEL": "claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "model": "claude-sonnet-5"
+}
+```
+
+2. Запустите Claude Code:
+```bash
+claude
+```
+
+3. Переключение моделей внутри Claude Code:
+- Переключение на Claude Opus:
+  ```text
+  /model claude-opus-5
+  ```
+- Переключение на Claude Sonnet:
+  ```text
+  /model claude-sonnet-5
+  ```
+- Либо запуск сразу с нужной моделью:
+  ```bash
+  claude --model claude-opus-5
+  ```
+
+---
+
+### Настройка OpenAI Codex CLI
+
+Для использования `zed-ai-proxy` в Codex CLI:
+
+1. Добавьте провайдера `[model_providers.zed]` в файл `~/.codex/config.toml`:
+```toml
+model = "claude-sonnet-5"
+model_provider = "zed"
+
+[model_providers.zed]
+name = "Zed AI Proxy"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+request_max_retries = 3
+stream_max_retries = 5
+```
+
+2. Запустите Codex:
+```bash
+codex
+```
+
+3. Запуск с переопределением модели через CLI:
+```bash
+# Использовать Claude Sonnet
+codex -c model_provider=zed -c model=claude-sonnet-5
+
+# Использовать Claude Opus
+codex -c model_provider=zed -c model=claude-opus-5
+
+# Использовать GPT-5.6 Luna
+codex -c model_provider=zed -c model=gpt-5.6-luna
 ```
 
 ---

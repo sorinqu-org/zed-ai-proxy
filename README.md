@@ -197,6 +197,83 @@ curl -N http://localhost:8080/v1/chat/completions \
 
 ---
 
+### Claude Code Integration
+
+To route Claude Code through `zed-ai-proxy`:
+
+1. Edit your `~/.claude/settings.json`:
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8080",
+    "ANTHROPIC_AUTH_TOKEN": "zed-proxy-token",
+    "ANTHROPIC_MODEL": "claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "model": "claude-sonnet-5"
+}
+```
+
+2. Run Claude Code:
+```bash
+claude
+```
+
+3. Switching models in Claude Code:
+- Switch to Claude Opus:
+  ```text
+  /model claude-opus-5
+  ```
+- Switch to Claude Sonnet:
+  ```text
+  /model claude-sonnet-5
+  ```
+- Or launch with specific model:
+  ```bash
+  claude --model claude-opus-5
+  ```
+
+---
+
+### Codex CLI Integration
+
+To route OpenAI Codex CLI through `zed-ai-proxy`:
+
+1. Add the `[model_providers.zed]` section to `~/.codex/config.toml`:
+```toml
+model = "claude-sonnet-5"
+model_provider = "zed"
+
+[model_providers.zed]
+name = "Zed AI Proxy"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+request_max_retries = 3
+stream_max_retries = 5
+```
+
+2. Run Codex:
+```bash
+codex
+```
+
+3. Overriding provider or model via CLI:
+```bash
+# Run with Claude Sonnet
+codex -c model_provider=zed -c model=claude-sonnet-5
+
+# Run with Claude Opus
+codex -c model_provider=zed -c model=claude-opus-5
+
+# Run with GPT-5.6 Luna
+codex -c model_provider=zed -c model=gpt-5.6-luna
+```
+
+---
+
 ## Running Tests
 
 ```bash

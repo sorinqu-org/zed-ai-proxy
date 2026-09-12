@@ -20,6 +20,7 @@ from app.adapters.openai_adapter import (
     openai_to_zed_body,
     parse_zed_chunk_to_openai_delta,
 )
+from app.adapters.responses_adapter import responses_to_zed_body
 from app.config import settings
 from app.core.account_pool import Account, AccountPool
 from app.views.status import router as status_router
@@ -103,15 +104,27 @@ MODELS_METADATA = [
     {"id": "gpt-5.6-sol", "object": "model", "owned_by": "zed"},
     {"id": "gemini-3.1-pro", "object": "model", "owned_by": "zed"},
     {"id": "gemini-3-flash", "object": "model", "owned_by": "zed"},
+    # Common client aliases for Claude Code / Codex / Cursor
+    {"id": "claude-3-7-sonnet-20250219", "object": "model", "owned_by": "zed"},
+    {"id": "claude-3-5-sonnet-20241022", "object": "model", "owned_by": "zed"},
+    {"id": "claude-3-5-sonnet-latest", "object": "model", "owned_by": "zed"},
+    {"id": "claude-3-opus-20240229", "object": "model", "owned_by": "zed"},
+    {"id": "claude-3-5-haiku-20241022", "object": "model", "owned_by": "zed"},
+    {"id": "gpt-4o", "object": "model", "owned_by": "zed"},
+    {"id": "gpt-4o-mini", "object": "model", "owned_by": "zed"},
+    {"id": "o1", "object": "model", "owned_by": "zed"},
+    {"id": "o3-mini", "object": "model", "owned_by": "zed"},
 ]
 
 
 @app.get("/v1/models")
+@app.get("/models")
 async def list_models() -> Dict[str, Any]:
     return {"object": "list", "data": MODELS_METADATA}
 
 
 @app.get("/v1/models/{model_id}")
+@app.get("/models/{model_id}")
 async def get_model(model_id: str) -> Dict[str, Any]:
     for m in MODELS_METADATA:
         if m["id"] == model_id:
@@ -199,6 +212,7 @@ async def forward_to_zed_cloud(
 
 
 @app.post("/v1/chat/completions")
+@app.post("/chat/completions")
 async def chat_completions(request: Request) -> Response:
     try:
         body = await request.json()
@@ -303,6 +317,7 @@ async def chat_completions(request: Request) -> Response:
 
 
 @app.post("/v1/messages")
+@app.post("/messages")
 async def anthropic_messages(request: Request) -> Response:
     try:
         body = await request.json()
@@ -416,3 +431,176 @@ async def anthropic_messages(request: Request) -> Response:
                 "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
             }
         )
+
+
+@app.post("/v1/responses")
+@app.post("/responses")
+async def responses_endpoint(request: Request) -> Response:
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+
+    stream = body.get("stream", True)
+    model = body.get("model", "claude-sonnet-5")
+    resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+    item_id = f"item_{uuid.uuid4().hex[:16]}"
+    zed_body = responses_to_zed_body(body)
+
+    shared_client = getattr(request.app.state, "client", None)
+    resp, account = await forward_to_zed_cloud(zed_body, pool, client=shared_client)
+
+    sse_headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    if stream:
+        async def event_generator() -> AsyncGenerator[bytes, None]:
+            full_text = ""
+            try:
+                # 1. response.created
+                ev_created = {
+                    "response": {
+                        "id": resp_id,
+                        "object": "response",
+                        "status": "in_progress",
+                        "model": model,
+                    }
+                }
+                yield f"event: response.created\ndata: {json.dumps(ev_created)}\n\n".encode("utf-8")
+
+                # 2. response.output_item.added
+                ev_item = {
+                    "response_id": resp_id,
+                    "output_index": 0,
+                    "item": {
+                        "id": item_id,
+                        "type": "message",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                }
+                yield f"event: response.output_item.added\ndata: {json.dumps(ev_item)}\n\n".encode("utf-8")
+
+                # 3. response.content_part.added
+                ev_part = {
+                    "response_id": resp_id,
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "text", "text": ""},
+                }
+                yield f"event: response.content_part.added\ndata: {json.dumps(ev_part)}\n\n".encode("utf-8")
+
+                # 4. Stream tokens
+                async for line in resp.aiter_lines():
+                    parsed = parse_zed_chunk_to_openai_delta(line, req_id=resp_id, model=model)
+                    if parsed:
+                        delta_str, finish_reason = parsed
+                        if delta_str == "[DONE]":
+                            break
+                        try:
+                            d_obj = json.loads(delta_str)
+                            delta_c = d_obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if delta_c:
+                                full_text += delta_c
+                                ev_delta = {
+                                    "response_id": resp_id,
+                                    "item_id": item_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": delta_c,
+                                }
+                                yield f"event: response.output_text.delta\ndata: {json.dumps(ev_delta)}\n\n".encode("utf-8")
+                        except Exception:
+                            pass
+
+                # 5. response.output_text.done
+                ev_text_done = {
+                    "response_id": resp_id,
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": full_text,
+                }
+                yield f"event: response.output_text.done\ndata: {json.dumps(ev_text_done)}\n\n".encode("utf-8")
+
+                # 6. response.content_part.done
+                ev_part_done = {
+                    "response_id": resp_id,
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "text", "text": full_text},
+                }
+                yield f"event: response.content_part.done\ndata: {json.dumps(ev_part_done)}\n\n".encode("utf-8")
+
+                # 7. response.output_item.done
+                ev_item_done = {
+                    "response_id": resp_id,
+                    "output_index": 0,
+                    "item": {
+                        "id": item_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": full_text}],
+                    },
+                }
+                yield f"event: response.output_item.done\ndata: {json.dumps(ev_item_done)}\n\n".encode("utf-8")
+
+                # 8. response.completed
+                ev_completed = {
+                    "response": {
+                        "id": resp_id,
+                        "object": "response",
+                        "status": "completed",
+                        "model": model,
+                        "output": [ev_item_done["item"]],
+                    }
+                }
+                yield f"event: response.completed\ndata: {json.dumps(ev_completed)}\n\n".encode("utf-8")
+
+            finally:
+                await resp.aclose()
+
+        return StreamingResponse(event_generator(), headers=sse_headers)
+    else:
+        full_text = ""
+        try:
+            async for line in resp.aiter_lines():
+                parsed = parse_zed_chunk_to_openai_delta(line, req_id=resp_id, model=model)
+                if parsed:
+                    delta_str, _ = parsed
+                    if delta_str != "[DONE]":
+                        try:
+                            d_obj = json.loads(delta_str)
+                            delta_c = d_obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if delta_c:
+                                full_text += delta_c
+                        except Exception:
+                            pass
+        finally:
+            await resp.aclose()
+
+        return JSONResponse({
+            "id": resp_id,
+            "object": "response",
+            "status": "completed",
+            "model": model,
+            "output": [
+                {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": full_text}],
+                }
+            ],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        })
+

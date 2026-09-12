@@ -38,6 +38,11 @@ async def test_models_endpoints():
         assert "claude-opus-5" in model_ids
         assert "claude-sonnet-5" in model_ids
 
+        # Test route alias /models without /v1
+        resp_alias = await client.get("/models")
+        assert resp_alias.status_code == 200
+        assert resp_alias.json()["object"] == "list"
+
         # Retrieve specific model
         resp_model = await client.get("/v1/models/claude-opus-5")
         assert resp_model.status_code == 200

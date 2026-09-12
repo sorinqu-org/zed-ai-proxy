@@ -97,3 +97,58 @@ def test_payload_filter():
     huge_data = "data:image/png;base64," + "A" * 600_000
     res = sanitize_message_content(huge_data, max_size_bytes=500_000)
     assert "[Image omitted" in res
+
+
+def test_model_normalization():
+    from app.adapters.anthropic_adapter import normalize_anthropic_model
+    from app.adapters.openai_adapter import normalize_openai_model
+
+    # Anthropic mappings
+    assert normalize_anthropic_model("claude-3-7-sonnet-20250219") == "claude-sonnet-5"
+    assert normalize_anthropic_model("claude-3-5-sonnet-20241022") == "claude-sonnet-5"
+    assert normalize_anthropic_model("claude-3-opus-20240229") == "claude-opus-5"
+    assert normalize_anthropic_model("claude-3-5-haiku-20241022") == "claude-haiku-4-5"
+    assert normalize_anthropic_model("claude-opus-5") == "claude-opus-5"
+
+    # OpenAI mappings
+    assert normalize_openai_model("gpt-4o") == "gpt-5.6-luna"
+    assert normalize_openai_model("o1") == "gpt-5.6-luna"
+    assert normalize_openai_model("o3-mini") == "gpt-5.6-luna"
+    assert normalize_openai_model("claude-3-7-sonnet-20250219") == "claude-sonnet-5"
+    assert normalize_openai_model("claude-3-opus-20240229") == "claude-opus-5"
+    assert normalize_openai_model("gemini-1.5-pro") == "gemini-3.1-pro"
+    assert normalize_openai_model("gemini-1.5-flash") == "gemini-3-flash"
+
+
+def test_responses_adapter():
+    from app.adapters.responses_adapter import (
+        convert_responses_input_to_messages,
+        responses_to_zed_body,
+    )
+
+    # String input with instructions
+    msgs = convert_responses_input_to_messages("Hello", instructions="System prompt")
+    assert len(msgs) == 2
+    assert msgs[0] == {"role": "system", "content": "System prompt"}
+    assert msgs[1] == {"role": "user", "content": "Hello"}
+
+    # List of message items
+    input_items = [
+        {"role": "user", "content": [{"type": "input_text", "text": "What is 2+2?"}]}
+    ]
+    msgs2 = convert_responses_input_to_messages(input_items)
+    assert len(msgs2) == 1
+    assert msgs2[0]["role"] == "user"
+    assert "2+2" in msgs2[0]["content"]
+
+    # Full responses request to zed body
+    req = {
+        "model": "claude-sonnet-5",
+        "input": "Calculate 5*5",
+        "instructions": "Be precise",
+    }
+    zed_body = responses_to_zed_body(req)
+    assert zed_body["provider"] == "anthropic"
+    assert zed_body["model"] == "claude-sonnet-5"
+
+

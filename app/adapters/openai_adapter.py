@@ -147,9 +147,34 @@ def convert_messages_for_anthropic(messages: List[Dict[str, Any]]) -> Tuple[Opti
     return system_prompt, processed_turns
 
 
+def normalize_openai_model(model: str) -> str:
+    """Maps client model strings to Zed Cloud model identifiers."""
+    m = model.lower().strip()
+    if "opus" in m:
+        return "claude-opus-5"
+    if "haiku" in m:
+        return "claude-haiku-4-5"
+    if "fable" in m:
+        return "claude-fable-5"
+    if "sonnet" in m:
+        return "claude-sonnet-5"
+    if "gemini" in m:
+        if "pro" in m or "ultra" in m or "3.1" in m:
+            return "gemini-3.1-pro"
+        return "gemini-3-flash"
+    if "sol" in m:
+        return "gpt-5.6-sol"
+    if "luna" in m or "gpt" in m or "o1" in m or "o3" in m or "o4" in m or "codex" in m:
+        return "gpt-5.6-luna"
+    if "claude" in m:
+        return "claude-sonnet-5"
+    return model
+
+
 def openai_to_zed_body(req: Dict[str, Any]) -> Dict[str, Any]:
     """Converts an OpenAI-style chat completion request into a Zed CompletionBody."""
-    model = req.get("model", "claude-sonnet-5")
+    raw_model = req.get("model", "claude-sonnet-5")
+    model = normalize_openai_model(raw_model)
     provider = detect_provider(model)
     raw_messages = filter_payload(req.get("messages") or [])
 
