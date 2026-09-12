@@ -104,6 +104,7 @@ def convert_messages_for_anthropic(messages: List[Dict[str, Any]]) -> Tuple[Opti
                 "type": "tool_result",
                 "tool_use_id": tool_call_id,
                 "content": tool_content,
+                "is_error": False,
             }
             # If previous message is already user, append block; otherwise new user turn
             if processed_turns and processed_turns[-1]["role"] == "user":

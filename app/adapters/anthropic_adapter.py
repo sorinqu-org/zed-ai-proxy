@@ -60,7 +60,32 @@ def anthropic_to_zed_body(req: Dict[str, Any]) -> Dict[str, Any]:
                     elif isinstance(b, str):
                         system_parts.append(b)
         else:
-            filtered_msgs.append(m)
+            # Normalize content into a sequence of blocks for Zed Cloud Anthropic parser
+            c = m.get("content")
+            if isinstance(c, str):
+                m_copy = dict(m)
+                m_copy["content"] = [{"type": "text", "text": c}]
+                filtered_msgs.append(m_copy)
+            elif isinstance(c, list):
+                m_copy = dict(m)
+                norm_blocks = []
+                for b in c:
+                    if isinstance(b, dict):
+                        if b.get("type") == "tool_result":
+                            nb = dict(b)
+                            if "is_error" not in nb or nb["is_error"] is None:
+                                nb["is_error"] = False
+                            if "content" not in nb or nb["content"] is None:
+                                nb["content"] = ""
+                            norm_blocks.append(nb)
+                        else:
+                            norm_blocks.append(b)
+                    elif isinstance(b, str):
+                        norm_blocks.append({"type": "text", "text": b})
+                m_copy["content"] = norm_blocks
+                filtered_msgs.append(m_copy)
+            else:
+                filtered_msgs.append(m)
 
     if system_parts:
         provider_req["system"] = "\n\n".join(system_parts)
@@ -79,6 +104,17 @@ def anthropic_to_zed_body(req: Dict[str, Any]) -> Dict[str, Any]:
     # Claude Code sends context_management: {edits: [{type: "clear_thinking_20251015"}]} which Zed Cloud rejects
     if "context_management" in provider_req:
         del provider_req["context_management"]
+
+    # Ensure any tools have guaranteed input_schema
+    if "tools" in provider_req and isinstance(provider_req["tools"], list):
+        norm_tools = []
+        for t in provider_req["tools"]:
+            if isinstance(t, dict):
+                nt = dict(t)
+                if "input_schema" not in nt or not nt["input_schema"]:
+                    nt["input_schema"] = {"type": "object", "properties": {}}
+                norm_tools.append(nt)
+        provider_req["tools"] = norm_tools
 
     provider_req["messages"] = filter_payload(filtered_msgs)
     provider_req["stream"] = True
