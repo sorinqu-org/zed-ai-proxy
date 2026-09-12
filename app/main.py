@@ -133,6 +133,71 @@ async def get_model(model_id: str) -> Dict[str, Any]:
     raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
 
+def extract_usage_from_sse_line(raw_line: str) -> Dict[str, int]:
+    """Extracts input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens from SSE line."""
+    line = raw_line.strip()
+    if not line or not line.startswith("data:"):
+        return {}
+    line = line[5:].strip()
+    if not line or line == "[DONE]":
+        return {}
+    try:
+        data = json.loads(line)
+        if not isinstance(data, dict):
+            return {}
+
+        event = data.get("event")
+        if not isinstance(event, dict):
+            event = data
+
+        ev_type = event.get("type")
+        res: Dict[str, int] = {}
+
+        if ev_type == "message_start":
+            u = event.get("message", {}).get("usage", {}) or event.get("usage", {})
+            if isinstance(u, dict):
+                if u.get("input_tokens") is not None:
+                    res["input_tokens"] = int(u["input_tokens"])
+                if u.get("cache_creation_input_tokens") is not None:
+                    res["cache_write_tokens"] = int(u["cache_creation_input_tokens"])
+                if u.get("cache_read_input_tokens") is not None:
+                    res["cache_read_tokens"] = int(u["cache_read_input_tokens"])
+                if u.get("output_tokens") is not None:
+                    res["output_tokens"] = int(u["output_tokens"])
+            return res
+
+        if ev_type == "message_delta":
+            u = event.get("usage", {})
+            if isinstance(u, dict):
+                if u.get("output_tokens") is not None:
+                    res["output_tokens"] = int(u["output_tokens"])
+                if u.get("input_tokens") is not None:
+                    res["input_tokens"] = int(u["input_tokens"])
+                if u.get("cache_creation_input_tokens") is not None:
+                    res["cache_write_tokens"] = int(u["cache_creation_input_tokens"])
+                if u.get("cache_read_input_tokens") is not None:
+                    res["cache_read_tokens"] = int(u["cache_read_input_tokens"])
+            return res
+
+        # Fallback for OpenAI or root usage object
+        usage = data.get("usage") or event.get("usage")
+        if usage and isinstance(usage, dict):
+            in_tok = usage.get("prompt_tokens") or usage.get("input_tokens")
+            out_tok = usage.get("completion_tokens") or usage.get("output_tokens")
+            c_read = usage.get("prompt_tokens_details", {}).get("cached_tokens") if isinstance(usage.get("prompt_tokens_details"), dict) else None
+            if in_tok is not None:
+                res["input_tokens"] = int(in_tok)
+            if out_tok is not None:
+                res["output_tokens"] = int(out_tok)
+            if c_read is not None:
+                res["cache_read_tokens"] = int(c_read)
+            return res
+
+        return {}
+    except Exception:
+        return {}
+
+
 async def forward_to_zed_cloud(
     zed_body: Dict[str, Any],
     pool: AccountPool,
@@ -245,6 +310,7 @@ async def chat_completions(request: Request) -> Response:
             role_sent = False
             done_sent = False
             full_text = ""
+            in_tok, out_tok, c_write, c_read = 0, 0, 0, 0
             try:
                 # 1. First chunk establishes role: assistant
                 initial_chunk = make_openai_chunk(req_id, model, {"role": "assistant"})
@@ -252,11 +318,20 @@ async def chat_completions(request: Request) -> Response:
                 role_sent = True
 
                 async for line in resp.aiter_lines():
+                    u = extract_usage_from_sse_line(line)
+                    if "input_tokens" in u:
+                        in_tok = u["input_tokens"]
+                    if "output_tokens" in u:
+                        out_tok = u["output_tokens"]
+                    if "cache_write_tokens" in u:
+                        c_write = u["cache_write_tokens"]
+                    if "cache_read_tokens" in u:
+                        c_read = u["cache_read_tokens"]
+
                     parsed = parse_zed_chunk_to_openai_delta(line, req_id=req_id, model=model)
                     if parsed:
                         delta_str, finish_reason = parsed
                         if delta_str == "[DONE]":
-                            # Emit terminal chunk if not yet sent
                             term_chunk = make_openai_chunk(req_id, model, {}, finish_reason="stop")
                             yield f"data: {term_chunk}\n\n".encode("utf-8")
                             yield b"data: [DONE]\n\n"
@@ -277,9 +352,15 @@ async def chat_completions(request: Request) -> Response:
                     yield b"data: [DONE]\n\n"
 
             finally:
-                in_tok = max(1, len(json.dumps(body)) // 4)
-                out_tok = max(1, len(full_text) // 4)
-                account.record_usage(in_tok, out_tok, model)
+                in_tok = in_tok or max(1, len(json.dumps(body)) // 4)
+                out_tok = out_tok or max(1, len(full_text) // 4)
+                account.record_usage(
+                    in_tok,
+                    out_tok,
+                    model=model,
+                    cache_write_tokens=c_write,
+                    cache_read_tokens=c_read,
+                )
                 await resp.aclose()
 
         return StreamingResponse(event_generator(), headers=sse_headers)
@@ -288,9 +369,20 @@ async def chat_completions(request: Request) -> Response:
         full_text = ""
         tool_calls: List[Dict[str, Any]] = []
         finish_reason = "stop"
+        in_tok, out_tok, c_write, c_read = 0, 0, 0, 0
 
         try:
             async for line in resp.aiter_lines():
+                u = extract_usage_from_sse_line(line)
+                if "input_tokens" in u:
+                    in_tok = u["input_tokens"]
+                if "output_tokens" in u:
+                    out_tok = u["output_tokens"]
+                if "cache_write_tokens" in u:
+                    c_write = u["cache_write_tokens"]
+                if "cache_read_tokens" in u:
+                    c_read = u["cache_read_tokens"]
+
                 parsed = parse_zed_chunk_to_openai_delta(line, req_id=req_id, model=model)
                 if parsed:
                     delta_str, f_reason = parsed
@@ -310,9 +402,15 @@ async def chat_completions(request: Request) -> Response:
         finally:
             await resp.aclose()
 
-        in_tok = max(1, len(json.dumps(body)) // 4)
-        out_tok = max(1, len(full_text) // 4)
-        account.record_usage(in_tok, out_tok, model)
+        in_tok = in_tok or max(1, len(json.dumps(body)) // 4)
+        out_tok = out_tok or max(1, len(full_text) // 4)
+        account.record_usage(
+            in_tok,
+            out_tok,
+            model=model,
+            cache_write_tokens=c_write,
+            cache_read_tokens=c_read,
+        )
 
         msg_payload: Dict[str, Any] = {"role": "assistant", "content": full_text}
         if tool_calls:
@@ -372,8 +470,19 @@ async def anthropic_messages(request: Request) -> Response:
         async def event_generator() -> AsyncGenerator[bytes, None]:
             done_sent = False
             total_chars = 0
+            in_tok, out_tok, c_write, c_read = 0, 0, 0, 0
             try:
                 async for line in resp.aiter_lines():
+                    u = extract_usage_from_sse_line(line)
+                    if "input_tokens" in u:
+                        in_tok = u["input_tokens"]
+                    if "output_tokens" in u:
+                        out_tok = u["output_tokens"]
+                    if "cache_write_tokens" in u:
+                        c_write = u["cache_write_tokens"]
+                    if "cache_read_tokens" in u:
+                        c_read = u["cache_read_tokens"]
+
                     parsed = parse_zed_chunk_to_anthropic_event(line)
                     if parsed:
                         event_type, event_data = parsed
@@ -386,9 +495,15 @@ async def anthropic_messages(request: Request) -> Response:
                 if not done_sent:
                     yield b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
             finally:
-                in_tok = max(1, len(json.dumps(body)) // 4)
-                out_tok = max(1, total_chars // 8)
-                account.record_usage(in_tok, out_tok, model)
+                in_tok = in_tok or max(1, len(json.dumps(body)) // 4)
+                out_tok = out_tok or max(1, total_chars // 8)
+                account.record_usage(
+                    in_tok,
+                    out_tok,
+                    model=model,
+                    cache_write_tokens=c_write,
+                    cache_read_tokens=c_read,
+                )
                 await resp.aclose()
 
         return StreamingResponse(event_generator(), headers=sse_headers)
@@ -398,11 +513,20 @@ async def anthropic_messages(request: Request) -> Response:
         stop_reason = "end_turn"
         tool_calls: List[Dict[str, Any]] = []
         msg_id = f"msg_{uuid.uuid4().hex[:16]}"
-        input_tokens = 0
-        output_tokens = 0
+        input_tokens, output_tokens, c_write, c_read = 0, 0, 0, 0
 
         try:
             async for line in resp.aiter_lines():
+                u = extract_usage_from_sse_line(line)
+                if "input_tokens" in u:
+                    input_tokens = u["input_tokens"]
+                if "output_tokens" in u:
+                    output_tokens = u["output_tokens"]
+                if "cache_write_tokens" in u:
+                    c_write = u["cache_write_tokens"]
+                if "cache_read_tokens" in u:
+                    c_read = u["cache_read_tokens"]
+
                 parsed = parse_zed_chunk_to_anthropic_event(line)
                 if parsed:
                     event_type, event_data = parsed
@@ -451,7 +575,13 @@ async def anthropic_messages(request: Request) -> Response:
 
         in_tok = input_tokens or max(1, len(json.dumps(body)) // 4)
         out_tok = output_tokens or max(1, len(full_text) // 4)
-        account.record_usage(in_tok, out_tok, model)
+        account.record_usage(
+            in_tok,
+            out_tok,
+            model=model,
+            cache_write_tokens=c_write,
+            cache_read_tokens=c_read,
+        )
 
         content_list: List[Dict[str, Any]] = []
         if full_text:
@@ -541,7 +671,18 @@ async def responses_endpoint(request: Request) -> Response:
                 yield f"event: response.content_part.added\ndata: {json.dumps(ev_part)}\n\n".encode("utf-8")
 
                 # 4. Stream tokens
+                in_tok, out_tok, c_write, c_read = 0, 0, 0, 0
                 async for line in resp.aiter_lines():
+                    u = extract_usage_from_sse_line(line)
+                    if "input_tokens" in u:
+                        in_tok = u["input_tokens"]
+                    if "output_tokens" in u:
+                        out_tok = u["output_tokens"]
+                    if "cache_write_tokens" in u:
+                        c_write = u["cache_write_tokens"]
+                    if "cache_read_tokens" in u:
+                        c_read = u["cache_read_tokens"]
+
                     parsed = parse_zed_chunk_to_openai_delta(line, req_id=resp_id, model=model)
                     if parsed:
                         delta_str, finish_reason = parsed
@@ -610,16 +751,33 @@ async def responses_endpoint(request: Request) -> Response:
                 yield f"event: response.completed\ndata: {json.dumps(ev_completed)}\n\n".encode("utf-8")
 
             finally:
-                in_tok = max(1, len(json.dumps(body)) // 4)
-                out_tok = max(1, len(full_text) // 4)
-                account.record_usage(in_tok, out_tok, model)
+                in_tok = in_tok or max(1, len(json.dumps(body)) // 4)
+                out_tok = out_tok or max(1, len(full_text) // 4)
+                account.record_usage(
+                    in_tok,
+                    out_tok,
+                    model=model,
+                    cache_write_tokens=c_write,
+                    cache_read_tokens=c_read,
+                )
                 await resp.aclose()
 
         return StreamingResponse(event_generator(), headers=sse_headers)
     else:
         full_text = ""
+        in_tok, out_tok, c_write, c_read = 0, 0, 0, 0
         try:
             async for line in resp.aiter_lines():
+                u = extract_usage_from_sse_line(line)
+                if "input_tokens" in u:
+                    in_tok = u["input_tokens"]
+                if "output_tokens" in u:
+                    out_tok = u["output_tokens"]
+                if "cache_write_tokens" in u:
+                    c_write = u["cache_write_tokens"]
+                if "cache_read_tokens" in u:
+                    c_read = u["cache_read_tokens"]
+
                 parsed = parse_zed_chunk_to_openai_delta(line, req_id=resp_id, model=model)
                 if parsed:
                     delta_str, _ = parsed
@@ -634,9 +792,15 @@ async def responses_endpoint(request: Request) -> Response:
         finally:
             await resp.aclose()
 
-        in_tok = max(1, len(json.dumps(body)) // 4)
-        out_tok = max(1, len(full_text) // 4)
-        account.record_usage(in_tok, out_tok, model)
+        in_tok = in_tok or max(1, len(json.dumps(body)) // 4)
+        out_tok = out_tok or max(1, len(full_text) // 4)
+        account.record_usage(
+            in_tok,
+            out_tok,
+            model=model,
+            cache_write_tokens=c_write,
+            cache_read_tokens=c_read,
+        )
 
         return JSONResponse({
             "id": resp_id,

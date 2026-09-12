@@ -22,6 +22,17 @@ def test_calculate_cost():
     cost_haiku = calculate_cost("claude-haiku-5", 1_000_000, 1_000_000)
     assert round(cost_haiku, 2) == 4.80
 
+    # Prompt Cache pricing: Sonnet base $3/M in, $15/M out
+    # Write = 1.25x = $3.75/M, Read = 0.10x = $0.30/M
+    cost_cache = calculate_cost(
+        "claude-sonnet-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_write_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+    )
+    assert round(cost_cache, 2) == 22.05
+
 
 def test_format_helpers():
     assert format_currency(12.3456) == "$12.35"
@@ -152,4 +163,68 @@ def test_fetch_orb_portal_billing_mock(monkeypatch):
     assert res["spend_used"] == 4.36
     assert res["customer_name"] == "Zed VIP Test"
     assert res["portal_token"] == "test_token_123"
+
+
+def test_account_model_stats_and_cache():
+    acc = Account(
+        id="acc-token-test",
+        user_id="user_tokens",
+        access_token="tok_123",
+        spend_limit=50.0,
+        spend_used=0.0,
+        balance_remaining=50.0,
+    )
+
+    acc.record_usage(
+        input_tokens=1000,
+        output_tokens=500,
+        model="claude-3-5-sonnet",
+        cache_write_tokens=2000,
+        cache_read_tokens=4000,
+    )
+
+    assert acc.input_tokens_total == 1000
+    assert acc.output_tokens_total == 500
+    assert acc.cache_write_tokens_total == 2000
+    assert acc.cache_read_tokens_total == 4000
+    assert acc.tokens_used == 7500
+
+    stats = acc.model_stats["claude-3-5-sonnet"]
+    assert stats["input_tokens"] == 1000
+    assert stats["output_tokens"] == 500
+    assert stats["cache_write_tokens"] == 2000
+    assert stats["cache_read_tokens"] == 4000
+    assert stats["total_tokens"] == 7500
+    assert stats["requests_count"] == 1
+    assert stats["cost_usd"] > 0
+
+    pool = AccountPool()
+    pool.add_account(acc)
+    total_stats = pool.get_total_model_stats()
+    assert "claude-3-5-sonnet" in total_stats
+    assert total_stats["claude-3-5-sonnet"]["cache_read_tokens"] == 4000
+
+
+def test_extract_usage_from_sse_line():
+    from app.main import extract_usage_from_sse_line
+
+    # 1. message_start line
+    line_start = 'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet-latest","usage":{"input_tokens":1240,"cache_creation_input_tokens":500,"cache_read_input_tokens":800,"output_tokens":1}}}'
+    usage_start = extract_usage_from_sse_line(line_start)
+    assert usage_start is not None
+    assert usage_start["input_tokens"] == 1240
+    assert usage_start["cache_write_tokens"] == 500
+    assert usage_start["cache_read_tokens"] == 800
+    assert usage_start["output_tokens"] == 1
+
+    # 2. message_delta line
+    line_delta = 'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":342}}'
+    usage_delta = extract_usage_from_sse_line(line_delta)
+    assert usage_delta is not None
+    assert usage_delta["output_tokens"] == 342
+    assert "input_tokens" not in usage_delta
+
+    # 3. non-usage line
+    line_ping = 'data: {"type":"ping"}'
+    assert not extract_usage_from_sse_line(line_ping)
 

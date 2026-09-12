@@ -1,10 +1,11 @@
 import html
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing import Dict, Any
 from app.config import settings
 from app.core.security import security_policy
 from app.core.billing import format_currency, format_tokens
+from app.views.account_dashboard import render_account_detail_page, render_model_stats_table
 
 router = APIRouter()
 
@@ -62,7 +63,7 @@ async def dashboard(request: Request) -> str:
 
         rows_html += f"""
         <tr>
-            <td><strong>{safe_id}</strong></td>
+            <td><a href="/dashboard/accounts/{safe_id}" style="color:#38bdf8; text-decoration:none; font-weight:600;">{safe_id} &rarr;</a></td>
             <td>{safe_name}</td>
             <td><span class="badge" style="background:#334155;">{plan_display}</span></td>
             <td><strong style="color:#10b981;">${bal_rem:.2f}</strong> <span style="color:#94a3b8; font-size:12px;">/ ${spend_lim:.2f}</span></td>
@@ -71,7 +72,7 @@ async def dashboard(request: Request) -> str:
             <td><span class="badge" style="background:{status_color};">{safe_status}</span></td>
             <td>{exp_str}</td>
             <td>{a['successful_requests']} / {a['total_requests']}</td>
-            <td style="color:#ef4444; font-size:12px;">{last_err}</td>
+            <td><a href="/dashboard/accounts/{safe_id}" class="btn" style="padding:4px 10px; font-size:11px; text-decoration:none; display:inline-block;">Analytics &rarr;</a></td>
         </tr>
         """
 
@@ -204,19 +205,58 @@ async def dashboard(request: Request) -> str:
                     <th>Plan / Org</th>
                     <th>Balance</th>
                     <th>Tokens</th>
-                    <th>Zed Dashboard</th>
+                    <th>Portals</th>
                     <th>Status</th>
                     <th>Token Exp</th>
                     <th>Success / Total</th>
-                    <th>Last Error</th>
+                    <th>Analytics</th>
                 </tr>
             </thead>
             <tbody>
                 {rows_html if rows_html else '<tr><td colspan="10" style="text-align:center; color:#94a3b8;">No accounts configured. Check accounts.json</td></tr>'}
             </tbody>
         </table>
+
+        <div style="margin-top: 36px;">
+            <h2 style="font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f8fafc;">Pool Model Token Analytics</h2>
+            {render_model_stats_table(summary.get("total_model_stats", {}))}
+        </div>
     </div>
 </body>
 </html>
 """
     return html_content
+
+
+@router.get("/dashboard/accounts/{account_id}", response_class=HTMLResponse)
+async def account_dashboard(request: Request, account_id: str) -> str:
+    security_policy.verify_admin_auth(request)
+    pool = request.app.state.pool
+    account = pool.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail=f"Account '{account_id}' not found")
+    return render_account_detail_page(account, pool.accounts)
+
+
+@router.get("/api/accounts/{account_id}/stats", response_class=JSONResponse)
+async def account_stats(request: Request, account_id: str) -> Dict[str, Any]:
+    security_policy.verify_admin_auth(request)
+    pool = request.app.state.pool
+    account = pool.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail=f"Account '{account_id}' not found")
+    return {
+        "id": account.id,
+        "name": account.name,
+        "user_id": account.user_id,
+        "status": account.status,
+        "balance_remaining": account.balance_remaining,
+        "spend_limit": account.spend_limit,
+        "tokens_used": account.tokens_used,
+        "input_tokens_total": account.input_tokens_total,
+        "output_tokens_total": account.output_tokens_total,
+        "cache_write_tokens_total": account.cache_write_tokens_total,
+        "cache_read_tokens_total": account.cache_read_tokens_total,
+        "model_stats": account.model_stats,
+    }
+

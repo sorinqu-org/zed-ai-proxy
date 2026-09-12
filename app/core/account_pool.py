@@ -36,6 +36,11 @@ class Account(BaseModel):
     spend_used: float = 0.00
     balance_remaining: float = 10.00
     tokens_used: int = 0
+    input_tokens_total: int = 0
+    output_tokens_total: int = 0
+    cache_write_tokens_total: int = 0
+    cache_read_tokens_total: int = 0
+    model_stats: Dict[str, Dict[str, Any]] = {}
     model_requests_used: int = 0
     model_requests_limit: Optional[int] = None
     last_billing_sync: Optional[float] = None
@@ -49,11 +54,56 @@ class Account(BaseModel):
     last_error: Optional[str] = None
     last_used: Optional[float] = None
 
-    def record_usage(self, input_tokens: int, output_tokens: int, model: str = "") -> float:
-        cost = calculate_cost(model, input_tokens, output_tokens)
-        self.tokens_used += (input_tokens + output_tokens)
+    def record_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        model: str = "",
+        cache_write_tokens: int = 0,
+        cache_read_tokens: int = 0,
+    ) -> float:
+        cost = calculate_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_read_tokens=cache_read_tokens,
+        )
+        total_tok = input_tokens + output_tokens + cache_write_tokens + cache_read_tokens
+        self.tokens_used += total_tok
+        self.input_tokens_total += input_tokens
+        self.output_tokens_total += output_tokens
+        self.cache_write_tokens_total += cache_write_tokens
+        self.cache_read_tokens_total += cache_read_tokens
         self.spend_used += cost
         self.balance_remaining = max(0.0, round(self.spend_limit - self.spend_used, 4))
+        self.last_used = time.time()
+
+        # Update per-model breakdown
+        norm_model = (model or "unknown").strip()
+        if not norm_model:
+            norm_model = "unknown"
+        if norm_model not in self.model_stats:
+            self.model_stats[norm_model] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+                "requests_count": 0,
+                "cost_usd": 0.0,
+                "last_used": None,
+            }
+        st = self.model_stats[norm_model]
+        st["input_tokens"] += input_tokens
+        st["output_tokens"] += output_tokens
+        st["cache_write_tokens"] += cache_write_tokens
+        st["cache_read_tokens"] += cache_read_tokens
+        st["total_tokens"] += total_tok
+        st["requests_count"] += 1
+        st["cost_usd"] = round(st["cost_usd"] + cost, 4)
+        st["last_used"] = time.time()
+
         return cost
 
     def is_available(self) -> bool:
@@ -122,6 +172,11 @@ class AccountPool:
             billing_url = item.get("billing_url") or build_billing_url(org_id)
             orb_portal_url = item.get("orb_portal_url")
             orb_token = item.get("orb_token")
+            in_tok_tot = int(item.get("input_tokens_total", 0))
+            out_tok_tot = int(item.get("output_tokens_total", 0))
+            cw_tok_tot = int(item.get("cache_write_tokens_total", 0))
+            cr_tok_tot = int(item.get("cache_read_tokens_total", 0))
+            m_stats = dict(item.get("model_stats", {}))
 
             if prev and prev.access_token == tok_str:
                 cur_token = cur_token or prev.current_llm_token
@@ -137,6 +192,11 @@ class AccountPool:
                 billing_url = billing_url or prev.billing_url
                 orb_portal_url = orb_portal_url or getattr(prev, "orb_portal_url", None)
                 orb_token = orb_token or getattr(prev, "orb_token", None)
+                in_tok_tot = in_tok_tot or getattr(prev, "input_tokens_total", 0)
+                out_tok_tot = out_tok_tot or getattr(prev, "output_tokens_total", 0)
+                cw_tok_tot = cw_tok_tot or getattr(prev, "cache_write_tokens_total", 0)
+                cr_tok_tot = cr_tok_tot or getattr(prev, "cache_read_tokens_total", 0)
+                m_stats = m_stats or getattr(prev, "model_stats", {})
 
             account = Account(
                 id=acc_id,
@@ -154,6 +214,11 @@ class AccountPool:
                 spend_used=spend_used,
                 balance_remaining=balance_rem,
                 tokens_used=tokens_used,
+                input_tokens_total=in_tok_tot,
+                output_tokens_total=out_tok_tot,
+                cache_write_tokens_total=cw_tok_tot,
+                cache_read_tokens_total=cr_tok_tot,
+                model_stats=m_stats,
                 current_llm_token=cur_token,
                 expires_at=exp_at,
                 status=item.get("status", "active"),
@@ -373,6 +438,11 @@ class AccountPool:
                     "spend_used": round(a.spend_used, 4),
                     "balance_remaining": round(a.balance_remaining, 2),
                     "tokens_used": a.tokens_used,
+                    "input_tokens_total": a.input_tokens_total,
+                    "output_tokens_total": a.output_tokens_total,
+                    "cache_write_tokens_total": a.cache_write_tokens_total,
+                    "cache_read_tokens_total": a.cache_read_tokens_total,
+                    "model_stats": a.model_stats,
                     "model_requests_used": a.model_requests_used,
                     "model_requests_limit": a.model_requests_limit,
                 }
@@ -389,8 +459,43 @@ class AccountPool:
             "total_spend_limit": round(self.get_total_spend_limit(), 2),
             "total_spend_used": round(self.get_total_spend_used(), 4),
             "total_tokens_used": self.get_total_tokens_used(),
+            "total_model_stats": self.get_total_model_stats(),
             "accounts": accounts_info,
         }
+
+    def add_account(self, account: Account) -> None:
+        """Add an account to the pool."""
+        self.accounts.append(account)
+
+    def get_account(self, account_id: str) -> Optional[Account]:
+        for a in self.accounts:
+            if a.id == account_id or str(a.user_id) == str(account_id):
+                return a
+        return None
+
+    def get_total_model_stats(self) -> Dict[str, Dict[str, Any]]:
+        totals: Dict[str, Dict[str, Any]] = {}
+        for a in self.accounts:
+            for m_name, st in a.model_stats.items():
+                if m_name not in totals:
+                    totals[m_name] = {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "total_tokens": 0,
+                        "requests_count": 0,
+                        "cost_usd": 0.0,
+                    }
+                t = totals[m_name]
+                t["input_tokens"] += st.get("input_tokens", 0)
+                t["output_tokens"] += st.get("output_tokens", 0)
+                t["cache_write_tokens"] += st.get("cache_write_tokens", 0)
+                t["cache_read_tokens"] += st.get("cache_read_tokens", 0)
+                t["total_tokens"] += st.get("total_tokens", 0)
+                t["requests_count"] += st.get("requests_count", 0)
+                t["cost_usd"] = round(t["cost_usd"] + st.get("cost_usd", 0.0), 4)
+        return totals
 
     def get_total_balance_remaining(self) -> float:
         return sum(a.balance_remaining for a in self.accounts if a.is_available())

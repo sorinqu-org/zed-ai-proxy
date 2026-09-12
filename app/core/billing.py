@@ -34,17 +34,26 @@ PLAN_DEFAULT_LIMITS: Dict[str, float] = {
 }
 
 
-def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculates estimated cost in USD based on model pricing per 1M tokens."""
+def calculate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
+    """Calculates estimated cost in USD based on model pricing per 1M tokens, including cache creation and read."""
     pricing = DEFAULT_PRICING
     model_lower = (model or "").lower()
     for key, p in MODEL_PRICING.items():
         if key in model_lower:
             pricing = p
             break
-    cost_in = (input_tokens / 1_000_000.0) * pricing["input"]
+    base_in = pricing["input"]
+    cost_in = (input_tokens / 1_000_000.0) * base_in
     cost_out = (output_tokens / 1_000_000.0) * pricing["output"]
-    return cost_in + cost_out
+    cost_cache_write = (cache_write_tokens / 1_000_000.0) * (base_in * 1.25)
+    cost_cache_read = (cache_read_tokens / 1_000_000.0) * (base_in * 0.10)
+    return cost_in + cost_out + cost_cache_write + cost_cache_read
 
 
 def format_currency(amount: Optional[float]) -> str:
