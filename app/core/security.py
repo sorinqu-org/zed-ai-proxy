@@ -29,7 +29,7 @@ class SecurityPolicy:
     """
 
     def __init__(self):
-        self.tool_policy = getattr(settings, "tool_policy", "sanitize")  # "allow", "sanitize", "block_all"
+        self.tool_policy = getattr(settings, "tool_policy", "allow")  # "allow", "sanitize", "block_all"
         self.api_keys = getattr(settings, "api_keys", [])
         self.admin_key = getattr(settings, "admin_key", None)
 
